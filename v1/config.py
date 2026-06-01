@@ -19,7 +19,7 @@ TARGET_DRIFT_CAP = 0.10
 LEGACY_DRIFT_CAP = 0.10
 
 # --- Optimizer Controls ---
-RNG_SEED = 42
+RNG_SEED = 9999999
 OPTIMIZER_GRID_POINTS = 21
 OPTIMIZER_REFINEMENT_POINTS = 21
 MONOTONICITY_TOLERANCE = 0.002
@@ -30,7 +30,7 @@ TARGET_ASSET = "VT"
 
 # --- Holdings Inventory ---
 HOLDINGS = {
-    "VT": 47,
+    "VT": 0,
     "ACWI.SW": 84,
     "CHDVD.SW": 51,
     "MEUD.PA": 32.6,
@@ -93,7 +93,7 @@ OTC_REGISTRY = {
 
 # --- Balance Sheet Cash State ---
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 17982.81
+CURRENT_DEBT = 12157
 TODAY_DEPOSIT = 0
 
 # --- Future Projections Config ---

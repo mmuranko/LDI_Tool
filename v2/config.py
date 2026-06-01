@@ -86,8 +86,8 @@ ASSET_CURRENCIES = {
 # Now accepts the native local price. The engine will handle the FX conversion.
 OTC_REGISTRY = {
     "XS1970549561": {
-        "live_price_local": 888.80, # Native EUR price
-        "proxy_ticker": "EUN3.DE"  # EUR-denominated proxy ETF
+        "live_price_local": 882.70, # Native EUR price
+        "proxy_ticker": "EUN3.DE"   # EUR-denominated proxy ETF
     }
 }
 
