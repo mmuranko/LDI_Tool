@@ -2,21 +2,38 @@ import datetime
 
 # --- Tail Risk (Merton Jump-Diffusion Parameters) ---
 # Simulates sudden macroeconomic shocks (fat negative tails)
-JUMP_FREQUENCY_PER_YEAR = 0.12   # Expected number of macro shocks per year (e.g., 0.50 = one every 2 years)
+JUMP_FREQUENCY_PER_YEAR = 0.06   # Expected number of macro shocks per year (e.g., 0.50 = one every 2 years)
 JUMP_MEAN_SIZE = -0.15           # Mean log-jump size. Median simple jump is exp(-0.15)-1, about -14%.
-JUMP_VOLATILITY = 0.08           # Standard deviation of log-jump size, not simple-return volatility.
+JUMP_VOLATILITY = 0.06           # Standard deviation of log-jump size, not simple-return volatility.
 
 # --- Heston Stochastic Volatility Parameters ---
 HESTON_KAPPA = 5.0       # Mean-reversion speed (e.g., 3.0 means vol shocks decay over ~4 months)
-HESTON_XI = 0.4          # Volatility of Volatility (How aggressively the VIX itself swings)
+HESTON_XI = 0.5          # Volatility of Volatility (How aggressively the VIX itself swings)
 HESTON_RHO = -0.7        # Leverage Effect: When equities drop, variance violently spikes (highly negative correlation)
 
 # --- Simulation Risk Limits ---
-NUM_PATHS = 25000
+NUM_PATHS = 100000
 MAX_MARGIN_CALL_PROBABILITY = 0.05
-MAX_TARGET_LEVERAGE = 1.4
-TARGET_DRIFT_CAP = 0.10
-LEGACY_DRIFT_CAP = 0.10
+
+# Contribution-leverage policy search range.
+# The optimizer searches L in [1.0, MAX_CONTRIBUTION_LEVERAGE].
+MAX_CONTRIBUTION_LEVERAGE = 1.5
+
+# Portfolio-leverage guardrails for applying monthly contributions.
+#
+# Rule:
+#   leverage <= X      -> invest contribution at CONTRIBUTION_LEVERAGE
+#   X < leverage < Y   -> invest contribution unlevered, i.e. 1.0x
+#   leverage >= Y      -> deposit only; do not buy target asset
+#
+# Portfolio leverage is defined as:
+#   gross_assets / equity
+# where gross_assets includes target assets, legacy assets, and cash.
+CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX = 1.7   # X
+CONTRIBUTION_POLICY_NO_INVEST_MIN = 2.0       # Y
+
+TARGET_DRIFT_CAP = 0.09
+LEGACY_DRIFT_CAP = 0.09
 
 # --- Optimizer Controls ---
 RNG_SEED = 42
@@ -86,14 +103,14 @@ ASSET_CURRENCIES = {
 # Now accepts the native local price. The engine will handle the FX conversion.
 OTC_REGISTRY = {
     "XS1970549561": {
-        "live_price_local": 888.80, # Native EUR price
+        "live_price_local": 887.21, # Native EUR price
         "proxy_ticker": "EUN3.DE"  # EUR-denominated proxy ETF
     }
 }
 
 # --- Balance Sheet Cash State ---
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 17982.81
+CURRENT_DEBT = 17982.57
 TODAY_DEPOSIT = 0
 
 # --- Future Projections Config ---

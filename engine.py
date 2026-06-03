@@ -19,6 +19,8 @@ from config import (
     RNG_SEED,
     TODAY_DEPOSIT,
     WITHDRAWAL_SCHEDULE,
+    CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX,
+    CONTRIBUTION_POLICY_NO_INVEST_MIN
 )
 
 
@@ -126,6 +128,235 @@ class MarketSimulator:
             )
 
         return np.exp(jump_log_sizes)
+    
+
+
+    @staticmethod
+    def _portfolio_leverage(
+        v_target: np.ndarray,
+        v_legacy: np.ndarray,
+        cash: np.ndarray,
+        debt: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Total portfolio leverage used for contribution-policy guardrails.
+
+        Leverage = gross_assets / equity
+        gross_assets = target assets + legacy assets + cash
+        equity = gross_assets - debt
+
+        If equity <= 0, leverage is treated as infinity.
+        """
+        gross_assets = v_target + v_legacy + cash
+        equity = gross_assets - debt
+
+        leverage = np.full_like(gross_assets, np.inf, dtype=np.float64)
+        positive_equity = equity > 0.0
+
+        leverage[positive_equity] = (
+            gross_assets[positive_equity] / equity[positive_equity]
+        )
+
+        return leverage
+
+    @staticmethod
+    def _validate_contribution_policy_config() -> None:
+        """Validates X/Y contribution guardrails from config.py."""
+        if CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX < 1.0:
+            raise ValueError(
+                "[!] CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX should be >= 1.0."
+            )
+
+        if CONTRIBUTION_POLICY_NO_INVEST_MIN <= CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX:
+            raise ValueError(
+                "[!] Invalid contribution policy guardrails.\n"
+                f"    X = CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX = "
+                f"{CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX:.2f}\n"
+                f"    Y = CONTRIBUTION_POLICY_NO_INVEST_MIN = "
+                f"{CONTRIBUTION_POLICY_NO_INVEST_MIN:.2f}\n"
+                "    Required: Y > X."
+            )
+
+    def _contribution_multiplier(
+        self,
+        portfolio_leverage: np.ndarray,
+        contribution_leverage: float,
+        contribution_policy_mode: str = "guardrailed",
+    ) -> np.ndarray:
+        """
+        Maps current portfolio leverage to the target-asset purchase multiplier
+        applied to a cash contribution.
+
+        Modes:
+          "guardrailed":
+              leverage <= X      -> contribution_leverage
+              X < leverage < Y   -> 1.0
+              leverage >= Y      -> 0.0
+
+          "always_unlevered":
+              every contribution is invested at 1.0x, regardless of portfolio leverage.
+              This is the correct benchmark for "no future leverage".
+        """
+        contribution_leverage = float(contribution_leverage)
+
+        if contribution_leverage < 1.0:
+            raise ValueError(
+                "[!] contribution_leverage must be >= 1.0.\n"
+                f"    Received: {contribution_leverage:.4f}"
+            )
+
+        if contribution_policy_mode == "always_unlevered":
+            return np.ones_like(portfolio_leverage, dtype=np.float64)
+
+        if contribution_policy_mode != "guardrailed":
+            raise ValueError(
+                "[!] Unknown contribution_policy_mode.\n"
+                f"    Received: {contribution_policy_mode!r}\n"
+                "    Valid modes: 'guardrailed', 'always_unlevered'."
+            )
+
+        self._validate_contribution_policy_config()
+
+        multiplier = np.zeros_like(portfolio_leverage, dtype=np.float64)
+
+        full_policy_mask = portfolio_leverage <= CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX
+        unlevered_mask = (
+            (portfolio_leverage > CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX)
+            & (portfolio_leverage < CONTRIBUTION_POLICY_NO_INVEST_MIN)
+        )
+
+        multiplier[full_policy_mask] = contribution_leverage
+        multiplier[unlevered_mask] = 1.0
+
+        return multiplier
+
+    @staticmethod
+    def _withdraw_from_balance_sheet(
+        cash: np.ndarray,
+        debt: np.ndarray,
+        withdrawal_amount: float,
+    ) -> None:
+        """
+        Applies a liability withdrawal.
+
+        Cash is used first. Any unfunded remainder increases margin debt.
+        """
+        withdrawal_amount = float(withdrawal_amount)
+
+        if withdrawal_amount <= 0.0:
+            return
+
+        cash_used = np.minimum(cash, withdrawal_amount)
+        cash -= cash_used
+
+        unfunded_withdrawal = withdrawal_amount - cash_used
+        debt += unfunded_withdrawal
+
+    def _apply_contribution_policy(
+        self,
+        v_target: np.ndarray,
+        cash: np.ndarray,
+        debt: np.ndarray,
+        day: int,
+        deposit_amount: float,
+        contribution_leverage: float,
+        contribution_policy_mode: str = "guardrailed",
+    ) -> dict:
+        """
+        Applies the contribution-leverage policy to a deposit.
+
+        Interpretation:
+          - deposit enters the account as cash;
+          - cash first offsets existing margin debt;
+          - then the policy determines the target-asset purchase amount;
+          - purchases use available cash first, then margin debt.
+
+        This avoids the accounting bug where a 'deposit but do not invest'
+        contribution disappears from the simulation.
+        """
+        deposit_amount = float(deposit_amount)
+
+        if deposit_amount < 0.0:
+            raise ValueError(
+                f"[!] deposit_amount must be non-negative. Received {deposit_amount:,.2f}."
+            )
+
+        v_legacy = self.legacy_value_path[:, day].astype(np.float64, copy=False)
+
+        pre_contribution_leverage = self._portfolio_leverage(
+            v_target=v_target,
+            v_legacy=v_legacy,
+            cash=cash,
+            debt=debt,
+        )
+
+        multiplier = self._contribution_multiplier(
+            portfolio_leverage=pre_contribution_leverage,
+            contribution_leverage=contribution_leverage,
+            contribution_policy_mode=contribution_policy_mode,
+        )
+
+        purchase_amount = deposit_amount * multiplier
+
+        if contribution_policy_mode == "always_unlevered":
+            full_policy_mask = np.zeros_like(pre_contribution_leverage, dtype=bool)
+            unlevered_mask = np.ones_like(pre_contribution_leverage, dtype=bool)
+            no_invest_mask = np.zeros_like(pre_contribution_leverage, dtype=bool)
+        else:
+            full_policy_mask = (
+                pre_contribution_leverage <= CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX
+            )
+            unlevered_mask = (
+                (pre_contribution_leverage > CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX)
+                & (pre_contribution_leverage < CONTRIBUTION_POLICY_NO_INVEST_MIN)
+            )
+            no_invest_mask = (
+                pre_contribution_leverage >= CONTRIBUTION_POLICY_NO_INVEST_MIN
+            )
+
+        if deposit_amount > 0.0:
+            # 1. Contribution arrives as cash.
+            cash += deposit_amount
+
+            # 2. In a margin account, positive cash offsets margin debt first.
+            debt_repayment = np.minimum(cash, debt)
+            cash -= debt_repayment
+            debt -= debt_repayment
+
+            # 3. Execute the target-asset purchase chosen by the policy.
+            cash_used_for_purchase = np.minimum(cash, purchase_amount)
+            cash -= cash_used_for_purchase
+
+            borrowed_for_purchase = purchase_amount - cash_used_for_purchase
+            debt += borrowed_for_purchase
+
+            v_target += purchase_amount
+
+        return {
+            "pre_contribution_leverage": pre_contribution_leverage,
+            "multiplier": multiplier,
+            "purchase_amount": purchase_amount,
+            "full_policy_share": float(np.mean(full_policy_mask)),
+            "unlevered_share": float(np.mean(unlevered_mask)),
+            "no_invest_share": float(np.mean(no_invest_mask)),
+        }
+
+    @staticmethod
+    def _contribution_action_label(
+        pre_contribution_leverage: float,
+        contribution_policy_mode: str = "guardrailed",
+    ) -> str:
+        """Human-readable action label for a single current-state leverage value."""
+        if contribution_policy_mode == "always_unlevered":
+            return "benchmark_always_invest_unlevered"
+
+        if pre_contribution_leverage <= CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX:
+            return "invest_at_contribution_leverage"
+
+        if pre_contribution_leverage < CONTRIBUTION_POLICY_NO_INVEST_MIN:
+            return "invest_unlevered"
+
+        return "deposit_only_do_not_invest"
 
     def _precompute_market_paths(self) -> None:
         """
@@ -243,15 +474,9 @@ class MarketSimulator:
             jump_multiplier = self._shared_jump_multiplier(rng, jump_lambda)
 
             v_prev = np.maximum(var_assets, 0.0)
-            dW_v_assets = rho_sv * dW_assets + rho_sv_comp * z_vol_assets
-            var_assets = (
-                var_assets
-                + kappa * (theta[:, None] - v_prev) * self.dt
-                + xi * np.sqrt(v_prev) * dW_v_assets
-            )
-            var_assets = np.maximum(var_assets, 0.0)
 
             inst_vol_assets = np.sqrt(var_assets)
+
             asset_drift = (
                 asset_mus[:, None]
                 - expected_jump
@@ -262,6 +487,16 @@ class MarketSimulator:
                 np.exp(asset_drift + inst_vol_assets * dW_assets)
                 * jump_multiplier[None, :]
             )
+
+            dW_v_assets = rho_sv * dW_assets + rho_sv_comp * z_vol_assets
+
+            var_assets = (
+                var_assets
+                + kappa * (theta[:, None] - v_prev) * self.dt
+                + xi * np.sqrt(v_prev) * dW_v_assets
+            )
+
+            var_assets = np.maximum(var_assets, 0.0)
 
             if len(fx_factor_indices):
                 dW_fx = correlated_shocks[fx_factor_indices, :]
@@ -291,67 +526,139 @@ class MarketSimulator:
                     legacy_margin_rates * legacy_values
                 ).sum(axis=0).astype(np.float32)
 
-    def simulate(self, target_leverage: float, store_paths: bool = True) -> dict:
+    def simulate(
+        self,
+        contribution_leverage: float,
+        store_paths: bool = True,
+        store_final_nav: bool = False,
+        contribution_policy_mode: str = "guardrailed",
+    ) -> dict:
+        
         path_dtype = np.float32
+        contribution_leverage = float(contribution_leverage)
 
-        # --- Day 0 Mechanics ---
-        V_0 = self.state["v_target_0"] + self.state["v_legacy_0"]
-        E_0 = V_0 - CURRENT_DEBT + TODAY_DEPOSIT
-
-        target_assets = E_0 * target_leverage
-        purchase_amount = max(0.0, target_assets - V_0)
-
-        initial_debt = (
-            CURRENT_DEBT
-            + purchase_amount
-            - TODAY_DEPOSIT
-            + self.initial_withdrawal_amount
-        )
-
-        if initial_debt < -1e-8:
+        if contribution_leverage < 1.0:
             raise ValueError(
-                "[!] TODAY_DEPOSIT would create positive CHF cash / negative CHF debt.\n"
-                f"    CURRENT_DEBT: {CURRENT_DEBT:,.2f}\n"
-                f"    TODAY_DEPOSIT: {TODAY_DEPOSIT:,.2f}\n"
-                f"    Initial purchase: {purchase_amount:,.2f}\n"
-                f"    Resulting debt: {initial_debt:,.2f}\n"
-                "    This model assumes you intentionally maintain CHF margin debt."
+                "[!] contribution_leverage must be >= 1.0.\n"
+                f"    Received: {contribution_leverage:.4f}"
             )
 
-        initial_debt = max(0.0, initial_debt)
+        self._validate_contribution_policy_config()
 
+        # --- Day 0 Balance Sheet ---
         v_target = np.full(
             NUM_PATHS,
-            self.state["v_target_0"] + purchase_amount,
+            self.state["v_target_0"],
             dtype=np.float64,
         )
-        debt = np.full(NUM_PATHS, initial_debt, dtype=np.float64)
+
+        cash = np.zeros(NUM_PATHS, dtype=np.float64)
+        debt = np.full(NUM_PATHS, CURRENT_DEBT, dtype=np.float64)
+
         ruined = np.zeros(NUM_PATHS, dtype=bool)
         max_median_leverage = float("nan")
 
+        contribution_policy_log = []
+
+        # Apply any day-0 liability before today's contribution decision.
+        # This is conservative: the contribution guardrail sees the post-liability balance sheet.
+        if self.initial_withdrawal_amount > 0.0:
+            self._withdraw_from_balance_sheet(
+                cash=cash,
+                debt=debt,
+                withdrawal_amount=self.initial_withdrawal_amount,
+            )
+
+            # Conservative: a day-0 liability can cause a breach before today's deposit.
+            v_legacy_0 = self.legacy_value_path[:, 0].astype(np.float64, copy=False)
+            legacy_maintenance_0 = self.legacy_maintenance_path[:, 0].astype(
+                np.float64,
+                copy=False,
+            )
+            gross_assets_0 = v_target + v_legacy_0 + cash
+            equity_0 = gross_assets_0 - debt
+            maintenance_margin_0 = (
+                self.state["m_target"] * v_target + legacy_maintenance_0
+            )
+            ruined[:] |= (equity_0 - maintenance_margin_0) < 0.0
+
+        # Apply TODAY_DEPOSIT using the same contribution policy as future deposits.
+        day0_contribution_info = self._apply_contribution_policy(
+            v_target=v_target,
+            cash=cash,
+            debt=debt,
+            day=0,
+            deposit_amount=TODAY_DEPOSIT,
+            contribution_leverage=contribution_leverage,
+            contribution_policy_mode=contribution_policy_mode,
+        )
+
+        today_pre_contribution_leverage = float(
+            day0_contribution_info["pre_contribution_leverage"][0]
+        )
+        today_contribution_multiplier = float(day0_contribution_info["multiplier"][0])
+        today_purchase_chf = float(day0_contribution_info["purchase_amount"][0])
+        today_policy_action = self._contribution_action_label(
+            today_pre_contribution_leverage,
+            contribution_policy_mode=contribution_policy_mode,
+        )
+
         if store_paths:
+            contribution_policy_log.append(
+                {
+                    "day": 0,
+                    "deposit_amount": float(TODAY_DEPOSIT),
+                    "mean_purchase_amount": float(
+                        np.mean(day0_contribution_info["purchase_amount"])
+                    ),
+                    "full_policy_share": day0_contribution_info["full_policy_share"],
+                    "unlevered_share": day0_contribution_info["unlevered_share"],
+                    "no_invest_share": day0_contribution_info["no_invest_share"],
+                }
+            )
+
             V_target = np.empty((NUM_PATHS, self.days), dtype=path_dtype)
             V_legacy = np.empty((NUM_PATHS, self.days), dtype=path_dtype)
+            Cash = np.empty((NUM_PATHS, self.days), dtype=path_dtype)
             Leverage = np.empty((NUM_PATHS, self.days), dtype=path_dtype)
 
         daily_rate = MARGIN_INTEREST_RATE / 365.0
+
+        def check_margin(day: int) -> None:
+            v_legacy = self.legacy_value_path[:, day].astype(np.float64, copy=False)
+            legacy_maintenance = self.legacy_maintenance_path[:, day].astype(
+                np.float64,
+                copy=False,
+            )
+
+            gross_assets = v_target + v_legacy + cash
+            equity = gross_assets - debt
+
+            maintenance_margin = self.state["m_target"] * v_target + legacy_maintenance
+            excess_liquidity = equity - maintenance_margin
+
+            ruined[:] |= excess_liquidity < 0.0
 
         def record(day: int) -> None:
             nonlocal max_median_leverage
 
             v_legacy = self.legacy_value_path[:, day].astype(np.float64, copy=False)
-            legacy_maintenance = self.legacy_maintenance_path[:, day].astype(np.float64, copy=False)
+            legacy_maintenance = self.legacy_maintenance_path[:, day].astype(
+                np.float64,
+                copy=False,
+            )
 
-            gross_assets = v_target + v_legacy
+            gross_assets = v_target + v_legacy + cash
             equity = gross_assets - debt
 
             maintenance_margin = self.state["m_target"] * v_target + legacy_maintenance
             excess_liquidity = equity - maintenance_margin
-            ruined[:] |= excess_liquidity < 0
+
+            ruined[:] |= excess_liquidity < 0.0
 
             if store_paths:
                 leverage = np.full(NUM_PATHS, np.nan, dtype=path_dtype)
-                positive_equity = equity > 0
+                positive_equity = equity > 0.0
 
                 leverage[positive_equity] = (
                     gross_assets[positive_equity] / equity[positive_equity]
@@ -359,40 +666,95 @@ class MarketSimulator:
 
                 if np.any(positive_equity):
                     median_leverage = float(np.nanmedian(leverage))
+
                     if np.isfinite(median_leverage):
                         if not np.isfinite(max_median_leverage):
                             max_median_leverage = median_leverage
                         else:
-                            max_median_leverage = max(max_median_leverage, median_leverage)
+                            max_median_leverage = max(
+                                max_median_leverage,
+                                median_leverage,
+                            )
 
                 V_target[:, day] = v_target.astype(path_dtype)
                 V_legacy[:, day] = v_legacy.astype(path_dtype)
+                Cash[:, day] = cash.astype(path_dtype)
                 Leverage[:, day] = leverage
 
         record(0)
 
         for t in range(1, self.days):
+            # 1. Market evolution.
             v_target *= self.target_step_multiplier[:, t]
-            debt *= (1 + daily_rate)
 
-            if t in self.deposits_by_day:
-                base_deposit = self.deposits_by_day[t]
-                leveraged_purchase = base_deposit * target_leverage
-                new_debt = leveraged_purchase - base_deposit
+            # 2. Financing cost.
+            debt *= (1.0 + daily_rate)
 
-                v_target += leveraged_purchase
-                debt += new_debt
-
+            # 3. Liabilities first.
+            #    We check margin immediately after withdrawals so a same-day
+            #    deposit cannot hide a temporary margin breach.
             if t in self.withdrawals_by_day:
-                debt += self.withdrawals_by_day[t]
+                self._withdraw_from_balance_sheet(
+                    cash=cash,
+                    debt=debt,
+                    withdrawal_amount=self.withdrawals_by_day[t],
+                )
+                check_margin(t)
+
+            # 4. Contribution policy.
+            if t in self.deposits_by_day:
+                deposit_info = self._apply_contribution_policy(
+                    v_target=v_target,
+                    cash=cash,
+                    debt=debt,
+                    day=t,
+                    deposit_amount=self.deposits_by_day[t],
+                    contribution_leverage=contribution_leverage,
+                    contribution_policy_mode=contribution_policy_mode,
+                )
+
+                if store_paths:
+                    contribution_policy_log.append(
+                        {
+                            "day": int(t),
+                            "deposit_amount": float(self.deposits_by_day[t]),
+                            "mean_purchase_amount": float(
+                                np.mean(deposit_info["purchase_amount"])
+                            ),
+                            "full_policy_share": deposit_info["full_policy_share"],
+                            "unlevered_share": deposit_info["unlevered_share"],
+                            "no_invest_share": deposit_info["no_invest_share"],
+                        }
+                    )
 
             record(t)
+
+        # --- Terminal NAV / Equity ---
+        # NAV is the economically relevant terminal wealth metric:
+        #   NAV = target assets + legacy assets + cash - margin debt
+        final_legacy = self.legacy_value_path[:, -1].astype(np.float64, copy=False)
+        final_gross_assets = v_target + final_legacy + cash
+        final_nav = final_gross_assets - debt
+
+        final_leverage = np.full(NUM_PATHS, np.nan, dtype=np.float64)
+        positive_final_nav = final_nav > 0.0
+        final_leverage[positive_final_nav] = (
+            final_gross_assets[positive_final_nav] / final_nav[positive_final_nav]
+        )
 
         result = {
             "prob_ruin": float(np.mean(ruined)),
             "max_median_leverage": max_median_leverage,
             "time_axis": np.arange(self.days),
-            "optimal_purchase_chf": purchase_amount,
+
+            # Today's actionable order.
+            "optimal_purchase_chf": today_purchase_chf,
+            "today_pre_contribution_leverage": today_pre_contribution_leverage,
+            "today_contribution_multiplier": today_contribution_multiplier,
+            "today_policy_action": today_policy_action,
+
+            # Backward/transitional metadata.
+            "contribution_leverage_tested": contribution_leverage,
         }
 
         if store_paths:
@@ -400,8 +762,22 @@ class MarketSimulator:
                 {
                     "V_target": V_target,
                     "V_legacy": V_legacy,
+                    "Cash": Cash,
                     "Leverage": Leverage,
+                    "contribution_policy_log": contribution_policy_log,
                 }
             )
-
+        if store_paths or store_final_nav:
+            result.update(
+                {
+                    "Final_NAV": final_nav.copy(),
+                    "Final_Gross_Assets": final_gross_assets.copy(),
+                    "Final_Debt": debt.copy(),
+                    "Final_Cash": cash.copy(),
+                    "Final_Leverage": final_leverage.copy(),
+                    "Final_Ruined": ruined.copy(),
+                    "contribution_policy_mode": contribution_policy_mode,
+                }
+            )
+            
         return result

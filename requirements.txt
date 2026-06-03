@@ -12,3 +12,5 @@ scipy>=1.11.0
 # Renders the dual-panel leverage and asset composition tracking plots.
 matplotlib>=3.8.0
 tqdm
+scikit-learn
+rich
