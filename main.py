@@ -1,912 +1,444 @@
+import datetime
+import os
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.ticker import StrMethodFormatter
 import numpy as np
 from dateutil.relativedelta import relativedelta
 from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
 from data_fetcher import DataEngine
 from engine import MarketSimulator
-from optimizer import MarginOptimizer
+from optimizer import CRNGridOptimizer
 from config import (
-    CURRENT_DATE,
-    CURRENT_DEBT,
-    TODAY_DEPOSIT,
-    NUM_PATHS,
-    MAX_MARGIN_CALL_PROBABILITY,
-    POST_LAST_WITHDRAWAL_BUFFER_DAYS,
-    POST_LAST_WITHDRAWAL_BUFFER_MONTHS,
-    TARGET_ASSET,
-    WITHDRAWAL_SCHEDULE,
-    CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX,
-    CONTRIBUTION_POLICY_NO_INVEST_MIN,
+    CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, TODAY_DEPOSIT, NUM_PATHS, 
+    MAX_MARGIN_CALL_PROBABILITY, POST_LAST_WITHDRAWAL_BUFFER_DAYS, 
+    POST_LAST_WITHDRAWAL_BUFFER_MONTHS, ACTIVE_ASSET, WITHDRAWAL_SCHEDULE, BASE_CURRENCY
 )
 
-
 console = Console()
-
 
 # =============================================================================
 # Formatting helpers
 # =============================================================================
 
 def _safe_float(value) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("nan")
+    try: return float(value)
+    except (TypeError, ValueError): return float("nan")
 
-
-def _fmt_chf(value, decimals: int = 2) -> str:
+def _fmt_base_ccy(value, decimals: int = 2) -> str:
     x = _safe_float(value)
-
-    if not np.isfinite(x):
-        return "n/a"
-
-    return f"{x:,.{decimals}f} CHF"
-
+    if not np.isfinite(x): return "n/a"
+    return f"{x:,.{decimals}f} {BASE_CURRENCY}"
 
 def _fmt_pct(value, decimals: int = 2) -> str:
     x = _safe_float(value)
-
-    if not np.isfinite(x):
-        return "n/a"
-
+    if not np.isfinite(x): return "n/a"
     return f"{x:.{decimals}%}"
-
 
 def _fmt_x(value, decimals: int = 2) -> str:
     x = _safe_float(value)
-
-    if np.isposinf(x):
-        return "∞x"
-
-    if not np.isfinite(x):
-        return "n/a"
-
+    if np.isposinf(x): return "∞x"
+    if not np.isfinite(x): return "n/a"
     return f"{x:.{decimals}f}x"
 
-
-def _fmt_bool(value) -> str:
-    return "[green]Yes[/green]" if bool(value) else "[red]No[/red]"
-
-
 def _binomial_upper_95(p_hat: float, n: int) -> float:
-    """
-    Normal-approximation upper 95% Monte Carlo confidence bound.
-
-    Used only for reporting. The optimizer itself still uses the point estimate
-    unless you explicitly change optimizer.py.
-    """
     p_hat = float(p_hat)
-
-    if not np.isfinite(p_hat):
-        return float("nan")
-
-    if n <= 0:
-        return float("nan")
-
+    if not np.isfinite(p_hat) or n <= 0: return float("nan")
     se = np.sqrt(max(p_hat * (1.0 - p_hat), 1e-12) / n)
     return min(1.0, p_hat + 1.96 * se)
 
-
-def _get_optimal_contribution_leverage(results: dict) -> float:
-    """
-    Transitional helper while migrating from optimal_target_leverage to
-    optimal_contribution_leverage.
-    """
-    for key in (
-        "optimal_contribution_leverage",
-        "optimal_target_leverage",
-        "contribution_leverage_tested",
-    ):
-        if key in results and results[key] is not None:
-            return float(results[key])
-
-    return float("nan")
-
-
 def _risk_status(prob_ruin: float) -> str:
     upper_95 = _binomial_upper_95(prob_ruin, NUM_PATHS)
-
     if prob_ruin > MAX_MARGIN_CALL_PROBABILITY:
-        return "[bold red]BREACH[/bold red]"
-
+        return "[red]BREACH[/red]"
     if upper_95 > MAX_MARGIN_CALL_PROBABILITY:
-        return "[bold yellow]PASS, but close to risk budget[/bold yellow]"
-
-    return "[bold green]PASS[/bold green]"
-
+        return "[yellow]MARGINAL (Passes but close to budget)[/yellow]"
+    return "PASS"
 
 def print_banner(title: str, subtitle: str | None = None) -> None:
-    text = f"[bold]{title}[/bold]"
+    console.print(f"\n[bold]{title}[/bold]")
+    if subtitle: console.print(f"[dim]{subtitle}[/dim]")
+    console.print("─" * 65 + "\n")
 
-    if subtitle:
-        text += f"\n[dim]{subtitle}[/dim]"
-
-    console.print()
-    console.print(Panel.fit(text, border_style="cyan"))
-    console.print()
-
-
-def print_table(
-    title: str,
-    columns: list[str],
-    rows: list[list[str]],
-    right_align: set[str] | None = None,
-) -> None:
+def print_table(title: str, columns: list[str], rows: list[list[str]], right_align: set[str] | None = None) -> None:
     right_align = right_align or set()
-
-    table = Table(
-        title=title,
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        show_lines=False,
-        title_style="bold",
-    )
-
-    for column in columns:
-        table.add_column(
-            column,
-            justify="right" if column in right_align else "left",
-            overflow="fold",
-        )
-
-    for row in rows:
-        table.add_row(*[str(cell) for cell in row])
-
+    table = Table(title=title, box=box.SIMPLE, header_style="bold", show_lines=False, title_style="bold")
+    for column in columns: table.add_column(column, justify="right" if column in right_align else "left", overflow="fold")
+    for row in rows: table.add_row(*[str(cell) for cell in row])
     console.print(table)
-
+    console.print()
 
 # =============================================================================
 # Initial state and parameter reporting
 # =============================================================================
 
-def print_initial_state(state: dict, params: dict) -> None:
-    target = params["target_factor"]
+def print_initial_state(state: dict) -> float:
+    assets = state["assets_dict"]
+    gross_assets = sum(info["v0"] for info in assets.values())
+    active_value = assets[ACTIVE_ASSET]["v0"]
+    passive_value = gross_assets - active_value
+    
+    total_mmr = sum(info["v0"] * info["mmr"] for info in assets.values())
+    total_imr = sum(info["v0"] * info["imr"] for info in assets.values())
 
-    v_target = float(state["v_target_0"])
-    v_legacy = float(state["v_legacy_0"])
-    gross_assets = v_target + v_legacy
-    nav_before_today_deposit = gross_assets - CURRENT_DEBT
-
-    current_leverage = (
-        gross_assets / nav_before_today_deposit
-        if nav_before_today_deposit > 0.0
-        else float("inf")
-    )
-
-    nav_after_today_deposit_before_trade = nav_before_today_deposit + TODAY_DEPOSIT
+    c = TODAY_DEPOSIT
+    d = CURRENT_DEBT
+    
+    if c > 0:
+        rep = min(c, d)
+        c -= rep
+        d -= rep
+        
+    gross_position = gross_assets + c
+    nlv_pre_trade = gross_position - d
+    el_pre_trade = nlv_pre_trade - total_mmr
+    current_leverage = (gross_position / nlv_pre_trade) if nlv_pre_trade > 0 else float("inf")
 
     balance_rows = [
-        ["Target asset", f"{TARGET_ASSET} ({target['currency']})"],
-        ["Target value", _fmt_chf(v_target)],
-        ["Legacy value", _fmt_chf(v_legacy)],
-        ["Gross assets", _fmt_chf(gross_assets)],
-        ["Current margin debt", _fmt_chf(CURRENT_DEBT)],
-        ["NAV before today's deposit", _fmt_chf(nav_before_today_deposit)],
-        ["Today's configured deposit", _fmt_chf(TODAY_DEPOSIT)],
-        [
-            "NAV after today's deposit before trade",
-            _fmt_chf(nav_after_today_deposit_before_trade),
-        ],
-        ["Portfolio leverage before today's deposit", _fmt_x(current_leverage)],
+        ["Active Rebalancing Asset", f"{ACTIVE_ASSET} ({assets[ACTIVE_ASSET]['currency']})"],
+        ["Active Asset Current Value", _fmt_base_ccy(active_value)],
+        ["Passive Portfolio Value", _fmt_base_ccy(passive_value)],
+        ["Gross Position Value", _fmt_base_ccy(gross_position)],
+        ["Current Margin Debt", _fmt_base_ccy(CURRENT_DEBT)],
+        ["Net Liquidation Value (NLV)", _fmt_base_ccy(nlv_pre_trade)],
+        ["Configured Cash Deposit (Today)", _fmt_base_ccy(TODAY_DEPOSIT)],
+        ["Excess Liquidity (EL)", _fmt_base_ccy(el_pre_trade)],
+        ["Reg T Special Memorandum (SMA)", _fmt_base_ccy(CURRENT_SMA)],
+        ["Pre-Trade Portfolio Leverage", _fmt_x(current_leverage)],
     ]
+    print_table("Initial Margin Sheet", ["Metric", "Value"], balance_rows, {"Value"})
+    return current_leverage
 
-    print_table(
-        title="Initial Balance Sheet",
-        columns=["Metric", "Value"],
-        rows=balance_rows,
-        right_align={"Value"},
-    )
-
-    asset_rows = []
-
-    for ticker in state["legacy_asset_order"]:
-        asset_state = state["legacy_assets"][ticker]
-        param_state = params["legacy_assets"].get(ticker, {})
-        sigma = param_state.get("sigma", float("nan"))
-
-        asset_rows.append(
-            [
-                ticker,
-                _fmt_chf(asset_state["v0"]),
-                asset_state["currency"],
-                _fmt_pct(asset_state["m"]),
-                _fmt_pct(sigma),
-            ]
-        )
-
-    if not asset_rows:
-        asset_rows = [["None", "-", "-", "-", "-"]]
-
-    print_table(
-        title="Legacy Assets",
-        columns=["Asset", "Value", "CCY", "Margin req.", "Vol"],
-        rows=asset_rows,
-        right_align={"Value", "Margin req.", "Vol"},
-    )
-
-    currency_rows = []
-
-    for ccy, bucket in sorted(state["legacy_by_currency"].items()):
-        currency_rows.append(
-            [
-                ccy,
-                _fmt_chf(bucket["v0"]),
-                _fmt_pct(bucket["m"]),
-                ", ".join(bucket["tickers"]),
-            ]
-        )
-
-    if not currency_rows:
-        currency_rows = [["None", "-", "-", "-"]]
-
-    print_table(
-        title="Legacy Currency Exposure",
-        columns=["CCY", "Value", "Avg. margin req.", "Assets"],
-        rows=currency_rows,
-        right_align={"Value", "Avg. margin req."},
-    )
-
-
-def print_parameter_summary(params: dict) -> None:
-    target = params["target_factor"]
-
-    factor_rows = [
-        [
-            "Target",
-            target["ticker"],
-            target["currency"],
-            _fmt_pct(target["mu_raw"]),
-            _fmt_pct(target["mu"]),
-            _fmt_pct(target["sigma"]),
-        ]
-    ]
-
-    for ticker, info in params["legacy_assets"].items():
-        factor_rows.append(
-            [
-                "Legacy",
-                ticker,
-                info["currency"],
-                _fmt_pct(info["mu_raw"]),
-                _fmt_pct(info["mu"]),
-                _fmt_pct(info["sigma"]),
-            ]
-        )
-
-    for ccy, info in params["fx_factors"].items():
-        factor_rows.append(
-            [
-                "FX",
-                f"{ccy}/{params['base_currency']}",
-                ccy,
-                _fmt_pct(info["mu_raw"]),
-                _fmt_pct(info["mu"]),
-                _fmt_pct(info["sigma"]),
-            ]
-        )
-
-    print_table(
-        title="Drift / Volatility Estimates",
-        columns=["Type", "Name", "CCY", "Raw drift", "Used drift", "Vol"],
-        rows=factor_rows,
-        right_align={"Raw drift", "Used drift", "Vol"},
-    )
-
-    engine_rows = [
-        ["Number of factors", f"{len(params['factor_names']):,}"],
-        ["Aligned observations", f"{params['aligned_observations']:,}"],
-        ["Base currency", params["base_currency"]],
-        ["Factor order", ", ".join(params["factor_names"])],
-    ]
-
-    print_table(
-        title="Correlation Engine",
-        columns=["Metric", "Value"],
-        rows=engine_rows,
-        right_align={"Value"},
-    )
-
-
-def print_simulation_horizon(
-    simulator: MarketSimulator,
-    final_date,
-    last_withdrawal_date,
-) -> None:
-    total_future_deposits = float(sum(simulator.deposit_amounts))
-    total_withdrawals = float(sum(simulator.withdrawal_amounts))
+def print_simulation_horizon(simulator: MarketSimulator, final_date, last_withdrawal_date) -> None:
+    total_future_deposits = float(np.sum(simulator.deposits_arr))
+    total_withdrawals = float(np.sum(simulator.withdrawals_arr) + simulator.initial_withdrawal_amount)
+    deposit_days_count = int(np.count_nonzero(simulator.deposits_arr))
 
     horizon_rows = [
         ["Start date", str(CURRENT_DATE)],
-        ["Last withdrawal date", str(last_withdrawal_date)],
         ["Final simulation date", str(final_date)],
         ["Calendar days", f"{simulator.days:,}"],
-        ["Future scheduled deposit dates", f"{len(simulator.deposit_days):,}"],
-        ["Total future scheduled deposits", _fmt_chf(total_future_deposits)],
-        ["Future withdrawal dates", f"{len(simulator.withdrawal_days):,}"],
-        ["Total future withdrawals", _fmt_chf(total_withdrawals)],
-        ["Monte Carlo paths", f"{NUM_PATHS:,}"],
+        ["Future deposit events", f"{deposit_days_count:,}"],
+        ["Total future scheduled deposits", _fmt_base_ccy(total_future_deposits)],
+        ["Total future scheduled withdrawals", _fmt_base_ccy(total_withdrawals)],
+        ["Monte Carlo simulated paths", f"{NUM_PATHS:,}"],
     ]
-
-    print_table(
-        title="Simulation Horizon",
-        columns=["Metric", "Value"],
-        rows=horizon_rows,
-        right_align={"Value"},
-    )
-
+    print_table("Simulation Horizon", ["Metric", "Value"], horizon_rows, {"Value"})
 
 # =============================================================================
-# Result reporting
+# Result reporting & Plotting
 # =============================================================================
 
-def print_execution_directive(optimal_results: dict) -> None:
-    optimal_contribution_leverage = _get_optimal_contribution_leverage(optimal_results)
-
+def print_execution_directive(optimal_results: dict, state: dict) -> None:
     prob_ruin = float(optimal_results["prob_ruin"])
     upper_95_ruin = _binomial_upper_95(prob_ruin, NUM_PATHS)
+    optimal_lev = optimal_results["optimal_target_leverage"]
+    
+    cash = 0.0
+    debt = float(CURRENT_DEBT)
+    
+    init_withdrawal = sum(float(w["amount"]) for w in WITHDRAWAL_SCHEDULE if (w["date"] - CURRENT_DATE).days == 0)
+    if init_withdrawal > 0.0:
+        cash_used = min(cash, init_withdrawal)
+        cash -= cash_used
+        debt += (init_withdrawal - cash_used)
 
-    today_order = float(optimal_results["optimal_purchase_chf"])
-    approximate_net_borrowing = today_order - TODAY_DEPOSIT
+    if TODAY_DEPOSIT > 0.0: cash += float(TODAY_DEPOSIT)
+        
+    debt_repay = min(cash, debt)
+    cash -= debt_repay
+    debt -= debt_repay
+    
+    gross_assets = sum(info["v0"] for info in state["assets_dict"].values())
+    gross = gross_assets + cash
+    nlv = gross - debt
+    
+    target_gross = nlv * optimal_lev if nlv > 0.0 else gross
+    purchase_amount = max(0.0, target_gross - gross)
+    
+    cash_used_for_purchase = min(cash, purchase_amount)
+    borrowed_amount = purchase_amount - cash_used_for_purchase
 
     rows = [
-        ["Status", _risk_status(prob_ruin)],
-        ["Recommended target-asset order today", _fmt_chf(today_order)],
-        ["Today's deposit", _fmt_chf(TODAY_DEPOSIT)],
-        [
-            "Approx. net borrowing from today's order",
-            _fmt_chf(approximate_net_borrowing),
-        ],
-        ["Optimal contribution leverage policy", _fmt_x(optimal_contribution_leverage)],
-        [
-            "Today pre-contribution portfolio leverage",
-            _fmt_x(optimal_results["today_pre_contribution_leverage"]),
-        ],
-        [
-            "Today contribution multiplier applied",
-            _fmt_x(optimal_results["today_contribution_multiplier"]),
-        ],
-        ["Today policy action", str(optimal_results["today_policy_action"])],
-        ["Full-leverage cutoff X", _fmt_x(CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX)],
-        ["No-invest cutoff Y", _fmt_x(CONTRIBUTION_POLICY_NO_INVEST_MIN)],
-        ["Margin-breach probability", _fmt_pct(prob_ruin)],
-        ["Margin-breach upper 95% MC bound", _fmt_pct(upper_95_ruin)],
-        ["Risk budget", _fmt_pct(MAX_MARGIN_CALL_PROBABILITY)],
-        ["Max median leverage observed", _fmt_x(optimal_results["max_median_leverage"])],
-        ["Optimizer method", str(optimal_results["optimizer_method"])],
-        ["Constraint binding", _fmt_bool(optimal_results["constraint_binding"])],
-        [
-            "Non-monotonic risk curve",
-            _fmt_bool(optimal_results["risk_curve_non_monotonic"]),
-        ],
+        ["Ruin Status", _risk_status(prob_ruin)],
+        ["Optimal Target Leverage", _fmt_x(optimal_lev)],
+        ["Today's Deposit Processed", _fmt_base_ccy(TODAY_DEPOSIT)],
+        ["Required Margin Borrowing", _fmt_base_ccy(borrowed_amount)],
+        [f"Total {ACTIVE_ASSET} Purchase", f"[bold green]{_fmt_base_ccy(purchase_amount)}[/bold green]"],
+        ["Dual-Constraint Ruin Prob.", _fmt_pct(prob_ruin)],
+        ["Breach Upper 95% Bound", _fmt_pct(upper_95_ruin)],
+        ["Risk Budget Limit", _fmt_pct(MAX_MARGIN_CALL_PROBABILITY)],
     ]
+    print_table("Execution Directive", ["Metric", "Value"], rows, {"Value"})
 
-    print_table(
-        title="Execution Directive",
-        columns=["Metric", "Value"],
-        rows=rows,
-        right_align={"Value"},
-    )
-
-
-def _extract_terminal_nav(
-    results: dict,
-    label: str,
-    survivors_only: bool = False,
-    drop_invalid: bool = True,
-) -> np.ndarray:
-    """Extracts terminal NAV values from a simulation result."""
-    if "Final_NAV" not in results:
-        raise KeyError(
-            f"[!] {label} result does not contain 'Final_NAV'. "
-            "Make sure engine.simulate(...) returns terminal NAV."
-        )
-
-    nav = np.asarray(results["Final_NAV"], dtype=np.float64)
-
+def _extract_terminal_nlv(results: dict, drop_invalid: bool = True, survivors_only: bool = True) -> np.ndarray:
+    nlv = np.asarray(results["Final_NLV"], dtype=np.float64)
     if survivors_only:
-        ruined = np.asarray(
-            results.get("Final_Ruined", np.zeros(nav.shape, dtype=bool)),
-            dtype=bool,
-        )
+        ruined = np.asarray(results.get("Final_Ruined", np.zeros(nlv.shape, dtype=bool)), dtype=bool)
+        nlv = nlv[~ruined]
+    if drop_invalid: nlv = nlv[np.isfinite(nlv)]
+    return nlv
 
-        if ruined.shape != nav.shape:
-            raise ValueError(
-                f"[!] {label} Final_Ruined shape does not match Final_NAV shape."
-            )
+def _nlv_summary(nlv: np.ndarray) -> dict:
+    if len(nlv) == 0: return {"mean": 0.0, "p05": 0.0, "median": 0.0, "p95": 0.0}
+    return {"mean": float(np.mean(nlv)), "p05": float(np.percentile(nlv, 5)), "median": float(np.percentile(nlv, 50)), "p95": float(np.percentile(nlv, 95))}
 
-        nav = nav[~ruined]
-
-    if drop_invalid:
-        nav = nav[np.isfinite(nav)]
-
-    if nav.size == 0:
-        raise ValueError(f"[!] No terminal NAV values available for {label}.")
-
-    return nav
-
-
-def _nav_summary(nav: np.ndarray) -> dict:
-    """Compact terminal NAV summary statistics."""
-    return {
-        "mean": float(np.mean(nav)),
-        "p05": float(np.percentile(nav, 5)),
-        "p25": float(np.percentile(nav, 25)),
-        "median": float(np.percentile(nav, 50)),
-        "p75": float(np.percentile(nav, 75)),
-        "p95": float(np.percentile(nav, 95)),
-    }
-
-
-def print_terminal_nav_comparison(
-    strategy_results: dict,
-    benchmark_results: dict,
-) -> None:
-    """
-    Prints paired terminal NAV comparison.
-
-    Because both simulations use the same MarketSimulator instance, the market
-    paths are the same. Therefore strategy NAV minus benchmark NAV is a pathwise
-    policy comparison.
-    """
-    strategy_nav = _extract_terminal_nav(
-        strategy_results,
-        label="optimized strategy",
-        survivors_only=False,
-        drop_invalid=False,
-    )
-
-    benchmark_nav = _extract_terminal_nav(
-        benchmark_results,
-        label="no-future-leverage benchmark",
-        survivors_only=False,
-        drop_invalid=False,
-    )
-
-    if strategy_nav.shape != benchmark_nav.shape:
-        raise ValueError(
-            "[!] Strategy and benchmark terminal NAV arrays have different shapes.\n"
-            f"    Strategy:  {strategy_nav.shape}\n"
-            f"    Benchmark: {benchmark_nav.shape}"
-        )
-
-    valid_pair = np.isfinite(strategy_nav) & np.isfinite(benchmark_nav)
-
-    if not np.any(valid_pair):
-        raise ValueError("[!] No valid paired terminal NAV observations available.")
-
-    strategy_nav = strategy_nav[valid_pair]
-    benchmark_nav = benchmark_nav[valid_pair]
-
-    nav_diff = strategy_nav - benchmark_nav
-
-    strategy_stats = _nav_summary(strategy_nav)
-    benchmark_stats = _nav_summary(benchmark_nav)
-    diff_stats = _nav_summary(nav_diff)
-
-    prob_outperform = float(np.mean(nav_diff > 0.0))
-
-    strategy_prob_ruin = float(strategy_results["prob_ruin"])
-    benchmark_prob_ruin = float(benchmark_results["prob_ruin"])
-    margin_breach_delta = strategy_prob_ruin - benchmark_prob_ruin
+def print_terminal_nlv_comparison(strategy_results: dict, benchmark_results: dict) -> None:
+    strategy_nlv = _extract_terminal_nlv(strategy_results, survivors_only=True)
+    benchmark_nlv = _extract_terminal_nlv(benchmark_results, survivors_only=True)
+    
+    strategy_stats, benchmark_stats = _nlv_summary(strategy_nlv), _nlv_summary(benchmark_nlv)
 
     rows = [
-        [
-            "Mean terminal NAV",
-            _fmt_chf(strategy_stats["mean"]),
-            _fmt_chf(benchmark_stats["mean"]),
-            _fmt_chf(diff_stats["mean"]),
-        ],
-        [
-            "5th percentile NAV / uplift",
-            _fmt_chf(strategy_stats["p05"]),
-            _fmt_chf(benchmark_stats["p05"]),
-            _fmt_chf(diff_stats["p05"]),
-        ],
-        [
-            "25th percentile NAV / uplift",
-            _fmt_chf(strategy_stats["p25"]),
-            _fmt_chf(benchmark_stats["p25"]),
-            _fmt_chf(diff_stats["p25"]),
-        ],
-        [
-            "Median terminal NAV / uplift",
-            _fmt_chf(strategy_stats["median"]),
-            _fmt_chf(benchmark_stats["median"]),
-            _fmt_chf(diff_stats["median"]),
-        ],
-        [
-            "75th percentile NAV / uplift",
-            _fmt_chf(strategy_stats["p75"]),
-            _fmt_chf(benchmark_stats["p75"]),
-            _fmt_chf(diff_stats["p75"]),
-        ],
-        [
-            "95th percentile NAV / uplift",
-            _fmt_chf(strategy_stats["p95"]),
-            _fmt_chf(benchmark_stats["p95"]),
-            _fmt_chf(diff_stats["p95"]),
-        ],
-        [
-            "Margin-breach probability",
-            _fmt_pct(strategy_prob_ruin),
-            _fmt_pct(benchmark_prob_ruin),
-            _fmt_pct(margin_breach_delta),
-        ],
-        [
-            "Margin-breach upper 95% MC bound",
-            _fmt_pct(_binomial_upper_95(strategy_prob_ruin, NUM_PATHS)),
-            _fmt_pct(_binomial_upper_95(benchmark_prob_ruin, NUM_PATHS)),
-            "-",
-        ],
-        [
-            "P(optimized NAV > benchmark NAV)",
-            "-",
-            "-",
-            _fmt_pct(prob_outperform),
-        ],
+        ["Mean Terminal NLV", _fmt_base_ccy(strategy_stats["mean"]), _fmt_base_ccy(benchmark_stats["mean"]), _fmt_base_ccy(strategy_stats["mean"] - benchmark_stats["mean"])],
+        ["Median Terminal NLV", _fmt_base_ccy(strategy_stats["median"]), _fmt_base_ccy(benchmark_stats["median"]), _fmt_base_ccy(strategy_stats["median"] - benchmark_stats["median"])],
+        ["SMA/EL Ruin Prob.", _fmt_pct(strategy_results["prob_ruin"]), _fmt_pct(benchmark_results["prob_ruin"]), "-"]
     ]
-
-    print_table(
-        title="Terminal NAV Policy Comparison",
-        columns=[
-            "Metric",
-            "Optimized policy",
-            "Benchmark: 1.00x future contributions",
-            "Pathwise uplift",
-        ],
-        rows=rows,
-        right_align={
-            "Optimized policy",
-            "Benchmark: 1.00x future contributions",
-            "Pathwise uplift",
-        },
-    )
+    print_table("Terminal NLV Comparison (Survivors)", ["Metric", "Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"], rows, {"Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"})
 
 
-# =============================================================================
-# Plots
-# =============================================================================
+def plot_time_series_bands(sim_results: dict) -> None:
+    if "history_paths" not in sim_results: return
+    
+    hist_data = sim_results["history_paths"]
+    dates = hist_data["dates"]
+    shape = hist_data["shape"]
+    
+    nlv_file, lev_file = hist_data["nlv_file"], hist_data["lev_file"]
+    nlv_hist = np.memmap(nlv_file, dtype=np.float32, mode='r', shape=shape)
+    lev_hist = np.memmap(lev_file, dtype=np.float32, mode='r', shape=shape)
+    
+    num_days = shape[1]
+    nlv_p = np.zeros((5, num_days), dtype=np.float32)
+    lev_p = np.zeros((5, num_days), dtype=np.float32)
+    
+    with console.status("Computing daily quantiles from disk cache...", spinner="dots"):
+        for t in range(num_days):
+            nlv_p[:, t] = np.nanpercentile(nlv_hist[:, t], [5, 25, 50, 75, 95])
+            lev_p[:, t] = np.nanpercentile(lev_hist[:, t], [5, 25, 50, 75, 95])
 
-def plot_diagnostics(sim_results: dict, withdrawal_days: list[int]) -> None:
-    """Generates a dual-panel diagnostic visualization."""
-    t = sim_results["time_axis"]
+    del nlv_hist, lev_hist
+    os.remove(nlv_file)
+    os.remove(lev_file)
 
+    # Change to a 2x1 vertical layout with a shared X-axis
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    plt.subplots_adjust(hspace=0.1)
 
-    # --- Top Panel: Gross asset dynamics ---
-    cash_paths = sim_results.get("Cash")
-
-    if cash_paths is None:
-        v_total = sim_results["V_target"] + sim_results["V_legacy"]
-    else:
-        v_total = sim_results["V_target"] + sim_results["V_legacy"] + cash_paths
-
-    v_5 = np.percentile(v_total, 5, axis=0)
-    v_25 = np.percentile(v_total, 25, axis=0)
-    v_50 = np.median(v_total, axis=0)
-    v_75 = np.percentile(v_total, 75, axis=0)
-    v_95 = np.percentile(v_total, 95, axis=0)
-
-    sample_value_lines = ax1.plot(
-        t,
-        v_total[0:5].T,
-        color="black",
-        alpha=0.20,
-        linewidth=1,
-    )
-    sample_value_lines[0].set_label("First 5 gross-asset paths")
-
-    ax1.plot(
-        t,
-        v_50,
-        color="#047857",
-        label="Median gross assets",
-        linewidth=2,
-    )
-    ax1.fill_between(
-        t,
-        v_25,
-        v_75,
-        color="#047857",
-        alpha=0.35,
-        label="50% interval",
-    )
-    ax1.fill_between(
-        t,
-        v_5,
-        v_95,
-        color="#047857",
-        alpha=0.15,
-        label="90% interval",
-    )
-
-    ax1.set_title(
-        "Projected Gross Assets Including Cash",
-        loc="left",
-        fontsize=12,
-        fontweight="bold",
-    )
-    ax1.set_ylabel("Gross Assets incl. Cash (CHF)")
+    # --- Top Plot: NLV ---
+    ax1.plot(dates, nlv_p[2], color="#047857", linewidth=2, label="Median NLV")
+    ax1.fill_between(dates, nlv_p[1], nlv_p[3], color="#10B981", alpha=0.4, label="25th - 75th Percentile")
+    ax1.fill_between(dates, nlv_p[0], nlv_p[4], color="#10B981", alpha=0.15, label="5th - 95th Percentile")
+    
+    ax1.set_title("Portfolio NLV & Dynamic Leverage Trajectories", loc="left", fontsize=14, fontweight="bold")
+    ax1.set_ylabel(f"Net Liquidation Value ({BASE_CURRENCY})")
     ax1.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
     ax1.grid(alpha=0.3)
     ax1.legend(loc="upper left")
+    
+    # Strictly bind the Y-axis to the actual data bounds of the 5th and 95th percentiles
+    ax1.set_ylim(np.min(nlv_p[0]), np.max(nlv_p[4]))
 
-    # --- Bottom Panel: Leverage dynamics ---
-    leverage_paths = sim_results["Leverage"]
-
-    lev_5 = np.nanpercentile(leverage_paths, 5, axis=0)
-    lev_25 = np.nanpercentile(leverage_paths, 25, axis=0)
-    lev_50 = np.nanmedian(leverage_paths, axis=0)
-    lev_75 = np.nanpercentile(leverage_paths, 75, axis=0)
-    lev_95 = np.nanpercentile(leverage_paths, 95, axis=0)
-
-    ax2.fill_between(
-        t,
-        lev_25,
-        lev_75,
-        color="#1E3A8A",
-        alpha=0.35,
-        label="50% interval",
-    )
-    ax2.fill_between(
-        t,
-        lev_5,
-        lev_95,
-        color="#1E3A8A",
-        alpha=0.15,
-        label="90% interval",
-    )
-
-    ax2.plot(
-        t,
-        leverage_paths[0:5].T,
-        color="black",
-        alpha=0.25,
-        linewidth=1,
-    )
-
-    ax2.plot(
-        t,
-        lev_50,
-        color="#1E3A8A",
-        label="Median leverage",
-        linewidth=2,
-    )
-
-    ax2.axhline(
-        y=CONTRIBUTION_POLICY_FULL_LEVERAGE_MAX,
-        color="#D97706",
-        linestyle=":",
-        linewidth=1.5,
-        alpha=0.9,
-        label="X: full contribution-leverage cutoff",
-    )
-
-    ax2.axhline(
-        y=CONTRIBUTION_POLICY_NO_INVEST_MIN,
-        color="#7F1D1D",
-        linestyle=":",
-        linewidth=1.5,
-        alpha=0.9,
-        label="Y: no-invest cutoff",
-    )
-
-    for wd in withdrawal_days:
-        ax2.axvline(x=wd, color="#B91C1C", linestyle="--", alpha=0.7)
-
-    if withdrawal_days:
-        ax2.axvline(
-            x=-100,
-            color="#B91C1C",
-            linestyle="--",
-            alpha=0.7,
-            label="Liability withdrawal",
-        )
-
-    ax2.set_xlim(0, t[-1])
-    ax2.set_title(
-        "Simulated Total Portfolio Leverage",
-        loc="left",
-        fontsize=12,
-        fontweight="bold",
-    )
-    ax2.set_ylabel("Total Leverage (x)")
-    ax2.set_xlabel("Simulation Horizon (Days)")
+    # --- Bottom Plot: Leverage ---
+    optimal_lev = sim_results["optimal_target_leverage"]
+    ax2.plot(dates, lev_p[2], color="#1E3A8A", linewidth=2, label="Median Leverage")
+    ax2.fill_between(dates, lev_p[1], lev_p[3], color="#3B82F6", alpha=0.4, label="25th - 75th Percentile")
+    ax2.fill_between(dates, lev_p[0], lev_p[4], color="#3B82F6", alpha=0.15, label="5th - 95th Percentile")
+    ax2.axhline(optimal_lev, color="#D97706", linestyle=":", linewidth=2, label="Rebalancing Target")
+    
+    ax2.set_ylabel("Portfolio Leverage (x)")
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     ax2.grid(alpha=0.3)
+    
+    # Strictly bind the Y-axis to the actual data bounds, including the target line
+    min_lev = min(np.min(lev_p[0]), optimal_lev)
+    max_lev = max(np.max(lev_p[4]), optimal_lev)
+    
+    # Add a tiny 2% visual buffer so the outer edges aren't clipped by the plot frame
+    y_range = max_lev - min_lev if max_lev > min_lev else 0.1
+    ax2.set_ylim(min_lev - (y_range * 0.02), max_lev + (y_range * 0.02))
+    
     ax2.legend(loc="upper left")
 
+    # Tight layout with zero vertical pad to merge the shared axis cleanly
+    fig.tight_layout()
+    plt.subplots_adjust(hspace=0.05)
+
+def plot_risk_curve(sim_results: dict) -> None:
+    if "grid_leverages" not in sim_results: return
+    
+    levs = sim_results["grid_leverages"]
+    probs = sim_results["grid_ruin_probs"] * 100.0 
+    optimal_lev = sim_results["optimal_target_leverage"]
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    ax.plot(levs, probs, color="#991B1B", linewidth=2.5, label="SMA/EL Ruin Probability")
+    ax.axhline(MAX_MARGIN_CALL_PROBABILITY * 100, color="black", linestyle="--", linewidth=1.5, label="Risk Budget Limit")
+    
+    optimal_prob = probs[np.where(np.isclose(levs, optimal_lev))[0][0]]
+    ax.scatter([optimal_lev], [optimal_prob], color="#D97706", s=100, zorder=5, label=f"Optimal Target ({optimal_lev:.2f}x)")
+    ax.vlines(x=optimal_lev, ymin=0, ymax=optimal_prob, color="#D97706", linestyle=":", linewidth=2)
+    
+    ax.set_title("Systemic Risk Profile Across Leverage Constraints", loc="left", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Target Portfolio Leverage (x)")
+    ax.set_ylabel("Probability of Margin Call (%)")
+    
+    max_y = min(100.0, max(10.0, optimal_prob * 3))
+    ax.set_ylim(0, max_y)
+    ax.set_xlim(levs[0], levs[-1])
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper left")
+    
     plt.tight_layout()
-    plt.show()
+
+def plot_terminal_diagnostics(sim_results: dict) -> None:
+    gross_assets = np.asarray(sim_results["Final_Gross_Assets"])
+    nlv = np.asarray(sim_results["Final_NLV"])
+    ruined = np.asarray(sim_results["Final_Ruined"], dtype=bool)
+
+    gross_survivors = gross_assets[~ruined]
+    nlv_survivors = nlv[~ruined]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        leverage = np.where(nlv_survivors > 0, gross_survivors / nlv_survivors, np.nan)
+    leverage = leverage[np.isfinite(leverage)]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Gross Assets Plot (with Overflow Clipping) ---
+    if len(gross_survivors) > 0:
+        g_low, g_high = np.percentile(gross_survivors, [0.5, 99.5])
+        gross_clipped = np.clip(gross_survivors, g_low, g_high)
+        
+        ax1.hist(gross_clipped, bins=90, color="#047857", alpha=0.6)
+        median_gross = np.median(gross_survivors) # Median uses original unclipped data
+        ax1.axvline(median_gross, color="#065F46", linestyle="--", linewidth=2, label=f"Median: {median_gross:,.0f} {BASE_CURRENCY}")
+        
+    ax1.set_title("Terminal Gross Assets (Survivors)", loc="left", fontsize=12, fontweight="bold")
+    ax1.set_xlabel(f"Gross Assets ({BASE_CURRENCY})\n*Outer bins contain clipped extreme outliers")
+    ax1.set_ylabel("Count")
+    ax1.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax1.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax1.grid(alpha=0.3)
+    ax1.legend()
+
+    # --- Leverage Plot (with Overflow Clipping) ---
+    if len(leverage) > 0:
+        # Leverage doesn't usually go negative, so we only cap the extreme upper tail
+        l_high = np.percentile(leverage, 99.5)
+        # Ensure the plot at least reaches the target leverage
+        max_plot_lev = max(sim_results["optimal_target_leverage"] * 1.5, l_high) 
+        leverage_clipped = np.clip(leverage, 1.0, max_plot_lev)
+
+        ax2.hist(leverage_clipped, bins=np.linspace(1.0, max_plot_lev, 90), color="#1E3A8A", alpha=0.6)
+        median_lev = np.median(leverage) # Median uses original unclipped data
+        
+        ax2.axvline(median_lev, color="#1E3A8A", linestyle="--", linewidth=2, label=f"Median Final Leverage: {median_lev:.2f}x")
+        ax2.axvline(sim_results["optimal_target_leverage"], color="#D97706", linestyle=":", linewidth=2, label=f"Target L: {sim_results['optimal_target_leverage']:.2f}x")
+        ax2.set_xlim(1.0, max_plot_lev)
+
+    ax2.set_title("Terminal Portfolio Leverage (Survivors)", loc="left", fontsize=12, fontweight="bold")
+    ax2.set_xlabel("Total Leverage (x)\n*Outer bins contain clipped extreme outliers")
+    ax2.set_ylabel("Count")
+    ax2.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax2.grid(alpha=0.3)
+    ax2.legend()
+
+    plt.tight_layout()
 
 
-def plot_terminal_nav_distribution(
-    strategy_results: dict,
-    benchmark_results: dict,
-    bins: int = 90,
-    trim_percentiles: tuple[float, float] = (0.5, 99.5),
-    survivors_only: bool = False,
+def plot_terminal_nlv_distribution(
+    strategy_results: dict, benchmark_results: dict, bins: int = 150, survivors_only: bool = True,
 ) -> None:
-    """
-    Overlays terminal NAV distributions for:
-      1. optimized contribution-leverage policy;
-      2. no-future-leverage benchmark.
-    """
-    strategy_nav = _extract_terminal_nav(
-        strategy_results,
-        label="optimized strategy",
-        survivors_only=survivors_only,
-    )
+    strategy_nlv = _extract_terminal_nlv(strategy_results, survivors_only=survivors_only)
+    benchmark_nlv = _extract_terminal_nlv(benchmark_results, survivors_only=survivors_only)
 
-    benchmark_nav = _extract_terminal_nav(
-        benchmark_results,
-        label="no-future-leverage benchmark",
-        survivors_only=survivors_only,
-    )
+    combined = np.concatenate([strategy_nlv, benchmark_nlv])
+    
+    # Identify the global boundaries for the 0.5% and 99.5% percentiles across BOTH datasets
+    if len(combined) > 0:
+        x_low, x_high = np.percentile(combined, [0.5, 99.5])
+    else:
+        x_low, x_high = 0.0, 1.0
 
-    combined = np.concatenate([strategy_nav, benchmark_nav])
-    x_low, x_high = np.percentile(combined, trim_percentiles)
-
-    if not np.isfinite(x_low) or not np.isfinite(x_high) or x_low >= x_high:
-        x_low = float(np.min(combined))
-        x_high = float(np.max(combined))
+    # Clip both arrays to these exact boundaries. 
+    # This creates the "Overflow Bin" effect at the extreme left and right.
+    strat_clipped = np.clip(strategy_nlv, x_low, x_high)
+    bench_clipped = np.clip(benchmark_nlv, x_low, x_high)
 
     bin_edges = np.linspace(x_low, x_high, bins + 1)
 
-    strategy_median = float(np.median(strategy_nav))
-    benchmark_median = float(np.median(benchmark_nav))
+    # Medians should always be calculated on the pure, unclipped data
+    strategy_median = float(np.median(strategy_nlv))
+    benchmark_median = float(np.median(benchmark_nlv))
     median_uplift = strategy_median - benchmark_median
-
-    optimal_contribution_leverage = _get_optimal_contribution_leverage(strategy_results)
+    optimal_target = strategy_results.get("optimal_target_leverage", 1.0)
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    ax.hist(
-        benchmark_nav,
-        bins=bin_edges,
-        density=True,
-        alpha=0.45,
-        color="#64748B",
-        label="Benchmark: future contributions at 1.00x",
-    )
+    ax.hist(bench_clipped, bins=bin_edges, alpha=0.45, color="#64748B", label="Benchmark (1.0x)")
+    ax.hist(strat_clipped, bins=bin_edges, alpha=0.45, color="#047857", label=f"Optimized Rebalancing ({optimal_target:.2f}x)")
 
-    ax.hist(
-        strategy_nav,
-        bins=bin_edges,
-        density=True,
-        alpha=0.45,
-        color="#047857",
-        label=(
-            f"Optimized policy: {optimal_contribution_leverage:.2f}x "
-            "when guardrails allow"
-        ),
-    )
+    ax.axvline(benchmark_median, color="#334155", linestyle="--", linewidth=2, label=f"Benchmark median: {benchmark_median:,.0f} {BASE_CURRENCY}")
+    ax.axvline(strategy_median, color="#065F46", linestyle="--", linewidth=2, label=f"Optimized median: {strategy_median:,.0f} {BASE_CURRENCY}")
 
-    ax.axvline(
-        benchmark_median,
-        color="#334155",
-        linestyle="--",
-        linewidth=2,
-        label=f"Benchmark median: {benchmark_median:,.0f} CHF",
-    )
-
-    ax.axvline(
-        strategy_median,
-        color="#065F46",
-        linestyle="--",
-        linewidth=2,
-        label=f"Optimized median: {strategy_median:,.0f} CHF",
-    )
-
-    ax.set_title(
-        "Terminal NAV Distribution: Optimized Policy vs No-Future-Leverage Benchmark",
-        loc="left",
-        fontsize=12,
-        fontweight="bold",
-    )
-    ax.set_xlabel("Terminal NAV / Equity (CHF)")
-    ax.set_ylabel("Density")
+    ax.set_title("Terminal NLV Distribution Comparison", loc="left", fontsize=12, fontweight="bold")
+    ax.set_xlabel(f"Net Liquidation Value ({BASE_CURRENCY})\n*Outer boundaries act as overflow bins for extreme 1% outliers")
+    ax.set_ylabel("Count")
     ax.set_xlim(x_low, x_high)
     ax.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
     ax.grid(alpha=0.3)
     ax.legend(loc="upper right")
 
     annotation = (
-        f"Median uplift: {median_uplift:,.0f} CHF\n"
+        f"Median uplift: {median_uplift:,.0f} {BASE_CURRENCY}\n"
         f"Optimized breach prob.: {strategy_results['prob_ruin']:.2%}\n"
         f"Benchmark breach prob.: {benchmark_results['prob_ruin']:.2%}\n"
-        f"Display range: p{trim_percentiles[0]:g} to p{trim_percentiles[1]:g}"
     )
 
-    ax.text(
-        0.02,
-        0.98,
-        annotation,
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        bbox={"boxstyle": "round", "alpha": 0.15},
-    )
-
+    ax.text(0.02, 0.98, annotation, transform=ax.transAxes, va="top", ha="left", bbox={"boxstyle": "round", "alpha": 0.85, "facecolor": "white", "edgecolor": "gray"})
     plt.tight_layout()
-    plt.show()
-
 
 # =============================================================================
 # Main orchestration
 # =============================================================================
 
 def main() -> None:
-    print_banner(
-        "LDI Optimization Engine",
-        "Contribution-leverage policy simulator",
-    )
+    print_banner("IBKR LDI Optimization Engine", "Dual-Constraint Ruin Engine (Reg T SMA + Maintenance Margin)")
 
     data_engine = DataEngine()
     data_engine.fetch_data()
-
     state = data_engine.build_current_state()
     params = data_engine.estimate_parameters()
 
-    print_initial_state(state, params)
-    print_parameter_summary(params)
-
-    if not WITHDRAWAL_SCHEDULE:
-        raise ValueError("[!] WITHDRAWAL_SCHEDULE is empty. Cannot infer simulation horizon.")
+    print_initial_state(state)
 
     last_withdrawal_date = max(w["date"] for w in WITHDRAWAL_SCHEDULE)
-
-    final_date = last_withdrawal_date + relativedelta(
-        months=POST_LAST_WITHDRAWAL_BUFFER_MONTHS,
-        days=POST_LAST_WITHDRAWAL_BUFFER_DAYS,
-    )
+    final_date = last_withdrawal_date + relativedelta(months=POST_LAST_WITHDRAWAL_BUFFER_MONTHS, days=POST_LAST_WITHDRAWAL_BUFFER_DAYS)
 
     simulator = MarketSimulator(state, params, final_date)
+    print_simulation_horizon(simulator, final_date, last_withdrawal_date)
 
-    print_simulation_horizon(
-        simulator=simulator,
-        final_date=final_date,
-        last_withdrawal_date=last_withdrawal_date,
-    )
-
-    optimizer = MarginOptimizer(simulator)
+    optimizer = CRNGridOptimizer(simulator)
     optimal_results = optimizer.optimize()
 
-    console.print(
-        "\n[bold cyan][*][/bold cyan] Running no-future-leverage benchmark "
-        "on the same market paths..."
-    )
+    console.print("[dim]Extracting benchmark (1.00x) paths for statistical comparison...[/dim]")
+    no_leverage_results = simulator.simulate(target_leverage=1.0, store_paths=True, store_history=False)
 
-    no_leverage_results = simulator.simulate(
-        1.0,
-        store_paths=False,
-        store_final_nav=True,
-        contribution_policy_mode="always_unlevered",
-    )
+    print_execution_directive(optimal_results, state)
+    print_terminal_nlv_comparison(optimal_results, no_leverage_results)
 
-    print_execution_directive(optimal_results)
-
-    print_terminal_nav_comparison(
-        strategy_results=optimal_results,
-        benchmark_results=no_leverage_results,
-    )
-
-    plot_diagnostics(
-        sim_results=optimal_results,
-        withdrawal_days=simulator.withdrawal_days,
-    )
-
-    plot_terminal_nav_distribution(
-        strategy_results=optimal_results,
-        benchmark_results=no_leverage_results,
-        survivors_only=False,
-    )
-
+    plot_time_series_bands(optimal_results)
+    plot_terminal_nlv_distribution(optimal_results, no_leverage_results)
+    plot_terminal_diagnostics(optimal_results)
+    plot_risk_curve(optimal_results)
+    
+    console.print("\n[dim]Visualizations generated. Close the plotting windows to exit the script.[/dim]")
+    plt.show()
 
 if __name__ == "__main__":
     main()
