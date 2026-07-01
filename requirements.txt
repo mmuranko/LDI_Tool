@@ -1,16 +1,8 @@
-# --- Market Data ---
-# yfinance handles the API connection to Yahoo Finance for spot prices and historical returns.
-yfinance>=0.2.37
-pandas>=2.1.0
-
-# --- Quantitative Engine & Vectorization ---
-# Core mathematical libraries for the Monte Carlo simulations and optimization routines.
-numpy>=1.26.0
-scipy>=1.11.0
-
-# --- Diagnostic Visualization ---
-# Renders the dual-panel leverage and asset composition tracking plots.
-matplotlib>=3.8.0
+yfinance
+pandas
+numpy
+scipy
+matplotlib
 tqdm
 scikit-learn
 rich

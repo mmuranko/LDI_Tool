@@ -401,7 +401,7 @@ def _fused_simulation_chunk(
 # ENVIRONMENT CLASS
 # =============================================================================
 class MarketSimulator:
-    def __init__(self, state: dict, params: dict, end_date: datetime.date):
+    def __init__(self, state: dict, params: dict, end_date: datetime.date, skip_next_deposit: bool = False):
         self.state = state
         self.params = params
         self.days = (end_date - CURRENT_DATE).days + 1
@@ -434,6 +434,11 @@ class MarketSimulator:
             if 0 < days_from_start < self.days:
                 amount = DEFAULT_MONTHLY_DEPOSIT_2026 if bme.year == 2026 else DEFAULT_MONTHLY_DEPOSIT_FUTURE
                 self.deposits_arr[days_from_start] += amount
+
+        if skip_next_deposit:
+            first_deposit_idx = np.nonzero(self.deposits_arr)[0]
+            if len(first_deposit_idx) > 0:
+                self.deposits_arr[first_deposit_idx[0]] = 0.0
 
         self._prepare_vectors()
 
@@ -515,9 +520,11 @@ class MarketSimulator:
         final_cash = np.zeros(NUM_PATHS, dtype=np.float32)
 
         if store_history:
-            nlv_hist = np.memmap('temp_nlv_hist.dat', dtype=np.float32, mode='w+', shape=(NUM_PATHS, self.days))
-            lev_hist = np.memmap('temp_lev_hist.dat', dtype=np.float32, mode='w+', shape=(NUM_PATHS, self.days))
-            history_interval = 1 
+            nlv_file = f'temp_nlv_hist_{target_leverage:.2f}.dat'
+            lev_file = f'temp_lev_hist_{target_leverage:.2f}.dat'
+            nlv_hist = np.memmap(nlv_file, dtype=np.float32, mode='w+', shape=(NUM_PATHS, self.days))
+            lev_hist = np.memmap(lev_file, dtype=np.float32, mode='w+', shape=(NUM_PATHS, self.days))
+            history_interval = 1
         else:
             nlv_hist = np.empty((0,0), dtype=np.float32)
             lev_hist = np.empty((0,0), dtype=np.float32)
@@ -575,9 +582,9 @@ class MarketSimulator:
             lev_hist.flush()
             
             history_days = [CURRENT_DATE + datetime.timedelta(days=t) for t in range(self.days)]
-            result["history_paths"] = {
-                "nlv_file": 'temp_nlv_hist.dat',
-                "lev_file": 'temp_lev_hist.dat',
+        result["history_paths"] = {
+                "nlv_file": nlv_file,
+                "lev_file": lev_file,
                 "shape": (NUM_PATHS, self.days),
                 "dates": history_days
             }

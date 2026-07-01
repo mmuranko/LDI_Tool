@@ -8,6 +8,7 @@ from dateutil.relativedelta import relativedelta
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.prompt import Confirm
 
 from data_fetcher import DataEngine
 from engine import MarketSimulator
@@ -186,18 +187,103 @@ def _nlv_summary(nlv: np.ndarray) -> dict:
     if len(nlv) == 0: return {"mean": 0.0, "p05": 0.0, "median": 0.0, "p95": 0.0}
     return {"mean": float(np.mean(nlv)), "p05": float(np.percentile(nlv, 5)), "median": float(np.percentile(nlv, 50)), "p95": float(np.percentile(nlv, 95))}
 
-def print_terminal_nlv_comparison(strategy_results: dict, benchmark_results: dict) -> None:
+def calculate_trajectory_twrr(simulator: MarketSimulator, sim_results: dict, use_median: bool = True) -> float:
+    if "history_paths" not in sim_results:
+        return float('nan')
+    
+    shape = sim_results["history_paths"]["shape"]
+    nlv_file = sim_results["history_paths"]["nlv_file"]
+    
+    # Read-only memmap to prevent data corruption
+    nlv_hist = np.memmap(nlv_file, dtype=np.float32, mode='r', shape=shape)
+    ruined = np.asarray(sim_results.get("Final_Ruined", np.zeros(shape[0], dtype=bool)))
+    
+    # Filter out paths that breached margin limits
+    survivors_idx = np.where(~ruined)[0]
+    num_survivors = len(survivors_idx)
+    
+    if num_survivors == 0:
+        return 0.0
+        
+    num_days = shape[1]
+    trajectory = np.zeros(num_days, dtype=np.float64)
+    
+    # --- Out-of-Core Memory Optimization ---
+    # To avoid massive RAM usage OR disk thrashing, we transpose the data in chunks
+    # into a temporary Day-Major memory map.
+    temp_transposed_file = nlv_file.replace('.dat', '_transposed.dat')
+    transposed_hist = np.memmap(temp_transposed_file, dtype=np.float32, mode='w+', shape=(num_days, num_survivors))
+    
+    # Strict RAM cap: 25k paths * 2000 days * 4 bytes = ~200 MB max RAM usage
+    chunk_size = 25000  
+    
+    with console.status(f"Performing out-of-core transpose on {num_survivors:,} paths...", spinner="dots"):
+        for start_idx in range(0, num_survivors, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_survivors)
+            
+            # Fast contiguous read from disk (Path-Major)
+            path_chunk = nlv_hist[survivors_idx[start_idx:end_idx], :] 
+            
+            # Fast contiguous write to disk (Day-Major)
+            transposed_hist[:, start_idx:end_idx] = path_chunk.T 
+            
+    with console.status("Computing continuous TWRR trajectory...", spinner="dots"):
+        for t in range(num_days):
+            # Now, reading a single day is a perfect contiguous block read!
+            day_data = transposed_hist[t, :]
+            
+            if use_median:
+                trajectory[t] = np.median(day_data)
+            else:
+                trajectory[t] = np.mean(day_data)
+    
+    if hasattr(transposed_hist, '_mmap'):
+        transposed_hist._mmap.close()
+    del transposed_hist
+    
+    if hasattr(nlv_hist, '_mmap'):
+        nlv_hist._mmap.close()
+    del nlv_hist
+    
+    if os.path.exists(temp_transposed_file):
+        os.remove(temp_transposed_file)
+        
+    # Isolate deterministic net cash flows: Deposits - Withdrawals
+    net_cf = np.zeros(num_days, dtype=np.float64)
+    net_cf[1:] = simulator.deposits_arr[1:] - simulator.withdrawals_arr[1:]
+    
+    twrr_index = 1.0
+    for t in range(1, num_days):
+        v_start = trajectory[t-1]
+        v_end = trajectory[t]
+        cf = net_cf[t]
+        
+        if v_start <= 0:
+            continue # Safe-guard against calculation breaks
+            
+        daily_ret = (v_end - cf) / v_start
+        twrr_index *= daily_ret
+        
+    years = num_days / 365.0
+    annualized_twrr = (twrr_index ** (1.0 / years)) - 1.0
+    
+    return float(annualized_twrr)
+
+def print_terminal_nlv_comparison(strategy_results: dict, benchmark_results: dict, strategy_twrr: float, benchmark_twrr: float) -> None:
     strategy_nlv = _extract_terminal_nlv(strategy_results, survivors_only=True)
     benchmark_nlv = _extract_terminal_nlv(benchmark_results, survivors_only=True)
     
     strategy_stats, benchmark_stats = _nlv_summary(strategy_nlv), _nlv_summary(benchmark_nlv)
 
+    twrr_uplift = strategy_twrr - benchmark_twrr if not np.isnan(strategy_twrr) and not np.isnan(benchmark_twrr) else float('nan')
+
     rows = [
         ["Mean Terminal NLV", _fmt_base_ccy(strategy_stats["mean"]), _fmt_base_ccy(benchmark_stats["mean"]), _fmt_base_ccy(strategy_stats["mean"] - benchmark_stats["mean"])],
         ["Median Terminal NLV", _fmt_base_ccy(strategy_stats["median"]), _fmt_base_ccy(benchmark_stats["median"]), _fmt_base_ccy(strategy_stats["median"] - benchmark_stats["median"])],
-        ["SMA/EL Ruin Prob.", _fmt_pct(strategy_results["prob_ruin"]), _fmt_pct(benchmark_results["prob_ruin"]), "-"]
+        ["SMA/EL Ruin Prob.", _fmt_pct(strategy_results["prob_ruin"]), _fmt_pct(benchmark_results["prob_ruin"]), "-"],
+        ["Annualized TWRR (Median Path)", _fmt_pct(strategy_twrr), _fmt_pct(benchmark_twrr), _fmt_pct(twrr_uplift)]
     ]
-    print_table("Terminal NLV Comparison (Survivors)", ["Metric", "Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"], rows, {"Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"})
+    print_table("Terminal NLV & Performance Comparison (Survivors)", ["Metric", "Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"], rows, {"Optimized Rebalancing", "Benchmark (1.0x)", "Uplift"})
 
 
 def plot_time_series_bands(sim_results: dict) -> None:
@@ -211,18 +297,63 @@ def plot_time_series_bands(sim_results: dict) -> None:
     nlv_hist = np.memmap(nlv_file, dtype=np.float32, mode='r', shape=shape)
     lev_hist = np.memmap(lev_file, dtype=np.float32, mode='r', shape=shape)
     
-    num_days = shape[1]
+    num_paths, num_days = shape
     nlv_p = np.zeros((5, num_days), dtype=np.float32)
     lev_p = np.zeros((5, num_days), dtype=np.float32)
     
-    with console.status("Computing daily quantiles from disk cache...", spinner="dots"):
-        for t in range(num_days):
-            nlv_p[:, t] = np.nanpercentile(nlv_hist[:, t], [5, 25, 50, 75, 95])
-            lev_p[:, t] = np.nanpercentile(lev_hist[:, t], [5, 25, 50, 75, 95])
+    # --- Out-of-Core Transpose ---
+    temp_nlv_t = nlv_file.replace('.dat', '_transposed.dat')
+    temp_lev_t = lev_file.replace('.dat', '_transposed.dat')
+    
+    nlv_transposed = np.memmap(temp_nlv_t, dtype=np.float32, mode='w+', shape=(num_days, num_paths))
+    lev_transposed = np.memmap(temp_lev_t, dtype=np.float32, mode='w+', shape=(num_days, num_paths))
+    
+    chunk_size = 25000 
+    
+    with console.status("Pivoting memory maps for fast quantile extraction...", spinner="dots"):
+        for start_idx in range(0, num_paths, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_paths)
+            
+            # Fast contiguous read -> transpose -> fast contiguous write
+            nlv_transposed[:, start_idx:end_idx] = nlv_hist[start_idx:end_idx, :].T
+            lev_transposed[:, start_idx:end_idx] = lev_hist[start_idx:end_idx, :].T
+            
+    # Process 25 days at a time. 
+    # For 1M paths, this strictly caps RAM usage at ~200MB per iteration.
+    chunk_days = 25  
+    
+    with console.status(f"Vectorizing daily quantiles in chunks of {chunk_days} days...", spinner="dots"):
+        for t_start in range(0, num_days, chunk_days):
+            t_end = min(t_start + chunk_days, num_days)
+            
+            # 1. Pull the chunk entirely into RAM as a standard array.
+            # This detaches it from the memmap, preventing Windows from locking up your page file.
+            nlv_chunk = np.array(nlv_transposed[t_start:t_end, :])
+            lev_chunk = np.array(lev_transposed[t_start:t_end, :])
+            
+            # 2. Compute across the entire chunk simultaneously (axis=1)
+            # NLV doesn't contain NaNs, so standard np.percentile is 5x faster and uses half the RAM.
+            nlv_p[:, t_start:t_end] = np.percentile(nlv_chunk, [5, 25, 50, 75, 95], axis=1)
+            
+            # Leverage does contain NaNs, so we must use nanpercentile here.
+            with np.errstate(invalid='ignore'):
+                lev_p[:, t_start:t_end] = np.nanpercentile(lev_chunk, [5, 25, 50, 75, 95], axis=1)
+            
+            # 3. Explicitly nuke the RAM arrays to keep usage perfectly flat at ~200MB
+            del nlv_chunk, lev_chunk
 
+    # Safely release the memory map locks (Explicit Windows Unlocking)
+    if hasattr(nlv_transposed, '_mmap'): nlv_transposed._mmap.close()
+    if hasattr(lev_transposed, '_mmap'): lev_transposed._mmap.close()
+    del nlv_transposed, lev_transposed
+    
+    if hasattr(nlv_hist, '_mmap'): nlv_hist._mmap.close()
+    if hasattr(lev_hist, '_mmap'): lev_hist._mmap.close()
     del nlv_hist, lev_hist
-    os.remove(nlv_file)
-    os.remove(lev_file)
+    
+    # Clean up only the transposed temp files (leave the originals for the global cleanup at the end of main)
+    if os.path.exists(temp_nlv_t): os.remove(temp_nlv_t)
+    if os.path.exists(temp_lev_t): os.remove(temp_lev_t)
 
     # Change to a 2x1 vertical layout with a shared X-axis
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
@@ -417,20 +548,26 @@ def main() -> None:
 
     print_initial_state(state)
 
+    skip_deposit = Confirm.ask("\n[bold yellow]?[/bold yellow] Skip the next scheduled month-end deposit? (e.g., if already manually funded)", default=False)
+    console.print()
+
     last_withdrawal_date = max(w["date"] for w in WITHDRAWAL_SCHEDULE)
     final_date = last_withdrawal_date + relativedelta(months=POST_LAST_WITHDRAWAL_BUFFER_MONTHS, days=POST_LAST_WITHDRAWAL_BUFFER_DAYS)
 
-    simulator = MarketSimulator(state, params, final_date)
+    simulator = MarketSimulator(state, params, final_date, skip_next_deposit=skip_deposit)
     print_simulation_horizon(simulator, final_date, last_withdrawal_date)
 
     optimizer = CRNGridOptimizer(simulator)
     optimal_results = optimizer.optimize()
 
     console.print("[dim]Extracting benchmark (1.00x) paths for statistical comparison...[/dim]")
-    no_leverage_results = simulator.simulate(target_leverage=1.0, store_paths=True, store_history=False)
+    no_leverage_results = simulator.simulate(target_leverage=1.0, store_paths=True, store_history=True)
+
+    strat_twrr = calculate_trajectory_twrr(simulator, optimal_results, use_median=True)
+    bench_twrr = calculate_trajectory_twrr(simulator, no_leverage_results, use_median=True)
 
     print_execution_directive(optimal_results, state)
-    print_terminal_nlv_comparison(optimal_results, no_leverage_results)
+    print_terminal_nlv_comparison(optimal_results, no_leverage_results, strat_twrr, bench_twrr)
 
     plot_time_series_bands(optimal_results)
     plot_terminal_nlv_distribution(optimal_results, no_leverage_results)
@@ -439,6 +576,20 @@ def main() -> None:
     
     console.print("\n[dim]Visualizations generated. Close the plotting windows to exit the script.[/dim]")
     plt.show()
+
+    def safe_remove(filepath):
+        try:
+            if os.path.exists(filepath): os.remove(filepath)
+        except Exception: 
+            pass
+
+    console.print("[dim]Cleaning up memory-mapped cache files...[/dim]")
+    if "history_paths" in optimal_results:
+        safe_remove(optimal_results["history_paths"]["nlv_file"])
+        safe_remove(optimal_results["history_paths"]["lev_file"])
+    if "history_paths" in no_leverage_results:
+        safe_remove(no_leverage_results["history_paths"]["nlv_file"])
+        safe_remove(no_leverage_results["history_paths"]["lev_file"])
 
 if __name__ == "__main__":
     main()
