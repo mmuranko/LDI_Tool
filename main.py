@@ -14,7 +14,7 @@ from data_fetcher import DataEngine
 from engine import MarketSimulator
 from optimizer import CRNGridOptimizer
 from config import (
-    CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, TODAY_DEPOSIT, NUM_PATHS, 
+    CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, NUM_PATHS, 
     MAX_MARGIN_CALL_PROBABILITY, POST_LAST_WITHDRAWAL_BUFFER_DAYS, 
     POST_LAST_WITHDRAWAL_BUFFER_MONTHS, ACTIVE_ASSET, WITHDRAWAL_SCHEDULE, BASE_CURRENCY
 )
@@ -83,18 +83,9 @@ def print_initial_state(state: dict) -> float:
     passive_value = gross_assets - active_value
     
     total_mmr = sum(info["v0"] * info["mmr"] for info in assets.values())
-    total_imr = sum(info["v0"] * info["imr"] for info in assets.values())
 
-    c = TODAY_DEPOSIT
-    d = CURRENT_DEBT
-    
-    if c > 0:
-        rep = min(c, d)
-        c -= rep
-        d -= rep
-        
-    gross_position = gross_assets + c
-    nlv_pre_trade = gross_position - d
+    gross_position = gross_assets
+    nlv_pre_trade = gross_position - CURRENT_DEBT
     el_pre_trade = nlv_pre_trade - total_mmr
     current_leverage = (gross_position / nlv_pre_trade) if nlv_pre_trade > 0 else float("inf")
 
@@ -105,7 +96,6 @@ def print_initial_state(state: dict) -> float:
         ["Gross Position Value", _fmt_base_ccy(gross_position)],
         ["Current Margin Debt", _fmt_base_ccy(CURRENT_DEBT)],
         ["Net Liquidation Value (NLV)", _fmt_base_ccy(nlv_pre_trade)],
-        ["Configured Cash Deposit (Today)", _fmt_base_ccy(TODAY_DEPOSIT)],
         ["Excess Liquidity (EL)", _fmt_base_ccy(el_pre_trade)],
         ["Reg T Special Memorandum (SMA)", _fmt_base_ccy(CURRENT_SMA)],
         ["Pre-Trade Portfolio Leverage", _fmt_x(current_leverage)],
@@ -143,15 +133,7 @@ def print_execution_directive(optimal_results: dict, state: dict) -> None:
     
     init_withdrawal = sum(float(w["amount"]) for w in WITHDRAWAL_SCHEDULE if (w["date"] - CURRENT_DATE).days == 0)
     if init_withdrawal > 0.0:
-        cash_used = min(cash, init_withdrawal)
-        cash -= cash_used
-        debt += (init_withdrawal - cash_used)
-
-    if TODAY_DEPOSIT > 0.0: cash += float(TODAY_DEPOSIT)
-        
-    debt_repay = min(cash, debt)
-    cash -= debt_repay
-    debt -= debt_repay
+        debt += init_withdrawal
     
     gross_assets = sum(info["v0"] for info in state["assets_dict"].values())
     gross = gross_assets + cash
@@ -166,7 +148,6 @@ def print_execution_directive(optimal_results: dict, state: dict) -> None:
     rows = [
         ["Ruin Status", _risk_status(prob_ruin)],
         ["Optimal Target Leverage", _fmt_x(optimal_lev)],
-        ["Today's Deposit Processed", _fmt_base_ccy(TODAY_DEPOSIT)],
         ["Required Margin Borrowing", _fmt_base_ccy(borrowed_amount)],
         [f"Total {ACTIVE_ASSET} Purchase", f"[bold green]{_fmt_base_ccy(purchase_amount)}[/bold green]"],
         ["Dual-Constraint Ruin Prob.", _fmt_pct(prob_ruin)],
@@ -548,7 +529,7 @@ def main() -> None:
 
     print_initial_state(state)
 
-    skip_deposit = Confirm.ask("\n[bold yellow]?[/bold yellow] Skip the next scheduled month-end deposit? (e.g., if already manually funded)", default=False)
+    skip_deposit = Confirm.ask("\n[bold yellow]?[/bold yellow] Skip the next scheduled month-end deposit? (e.g., if already manually funded and reflected in config.py)", default=False)
     console.print()
 
     last_withdrawal_date = max(w["date"] for w in WITHDRAWAL_SCHEDULE)

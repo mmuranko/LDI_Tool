@@ -10,7 +10,7 @@ from config import (
     CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, DEFAULT_MONTHLY_DEPOSIT_2026,
     DEFAULT_MONTHLY_DEPOSIT_FUTURE, HESTON_KAPPA, HESTON_RHO, HESTON_XI,
     JUMP_FREQUENCY_PER_YEAR, JUMP_MEAN_SIZE, JUMP_VOLATILITY,
-    MARGIN_INTEREST_RATE, NUM_PATHS, RNG_SEED, TODAY_DEPOSIT,
+    MARGIN_INTEREST_RATE, NUM_PATHS, RNG_SEED,
     WITHDRAWAL_SCHEDULE, HISTORY_INTERVAL_DAYS
 )
 
@@ -23,7 +23,7 @@ console = Console()
 def _fused_crn_grid_chunk(
     start_idx: int, end_idx: int, days: int, dt: np.float32, 
     current_debt: np.float32, current_sma: np.float32,
-    init_withdrawal: np.float32, today_deposit: np.float32, daily_rate: np.float32, 
+    init_withdrawal: np.float32, daily_rate: np.float32, 
     leverage_grid: np.ndarray,
     factor_mus: np.ndarray, factor_sigmas: np.ndarray, theta: np.ndarray, 
     kappa: np.float32, xi: np.float32, rho: np.float32, cholesky: np.ndarray, 
@@ -67,10 +67,6 @@ def _fused_crn_grid_chunk(
                 debts[l_idx] += (init_withdrawal - cash_used)
                 smas[l_idx] -= init_withdrawal 
 
-            if today_deposit > np.float32(0.0):
-                cashes[l_idx] += today_deposit
-                smas[l_idx] += today_deposit 
-                
             debt_repay = min(cashes[l_idx], debts[l_idx])
             cashes[l_idx] -= debt_repay
             debts[l_idx] -= debt_repay
@@ -210,7 +206,7 @@ def _fused_crn_grid_chunk(
 def _fused_simulation_chunk(
     start_idx: int, end_idx: int, days: int, dt: np.float32, 
     current_debt: np.float32, current_sma: np.float32,
-    init_withdrawal: np.float32, today_deposit: np.float32, daily_rate: np.float32, target_leverage: np.float32,
+    init_withdrawal: np.float32, daily_rate: np.float32, target_leverage: np.float32,
     factor_mus: np.ndarray, factor_sigmas: np.ndarray, theta: np.ndarray, 
     kappa: np.float32, xi: np.float32, rho: np.float32, cholesky: np.ndarray, 
     expected_jump: np.float32, jump_lambda: np.float32, jump_mean: np.float32, jump_vol: np.float32,
@@ -253,10 +249,6 @@ def _fused_simulation_chunk(
             debt += (init_withdrawal - cash_used)
             sma -= init_withdrawal
 
-        if today_deposit > np.float32(0.0):
-            cash += today_deposit
-            sma += today_deposit
-            
         debt_repay = min(cash, debt)
         cash -= debt_repay
         debt -= debt_repay
@@ -497,7 +489,7 @@ class MarketSimulator:
                 _fused_crn_grid_chunk(
                     start_idx=start_idx, end_idx=end_idx, days=self.days, dt=np.float32(self.dt),
                     current_debt=np.float32(CURRENT_DEBT), current_sma=np.float32(CURRENT_SMA),
-                    init_withdrawal=np.float32(self.initial_withdrawal_amount), today_deposit=np.float32(TODAY_DEPOSIT),
+                    init_withdrawal=np.float32(self.initial_withdrawal_amount),
                     daily_rate=np.float32(MARGIN_INTEREST_RATE / 365.0), leverage_grid=leverage_grid,
                     factor_mus=self.factor_mus, factor_sigmas=self.factor_sigmas, theta=self.theta,
                     kappa=np.float32(HESTON_KAPPA), xi=np.float32(HESTON_XI), rho=np.float32(HESTON_RHO), cholesky=self.cholesky,
@@ -547,7 +539,7 @@ class MarketSimulator:
                 _fused_simulation_chunk(
                     start_idx=start_idx, end_idx=end_idx, days=self.days, dt=np.float32(self.dt),
                     current_debt=np.float32(CURRENT_DEBT), current_sma=np.float32(CURRENT_SMA),
-                    init_withdrawal=np.float32(self.initial_withdrawal_amount), today_deposit=np.float32(TODAY_DEPOSIT),
+                    init_withdrawal=np.float32(self.initial_withdrawal_amount),
                     daily_rate=np.float32(MARGIN_INTEREST_RATE / 365.0), target_leverage=np.float32(target_leverage),
                     factor_mus=self.factor_mus, factor_sigmas=self.factor_sigmas, theta=self.theta,
                     kappa=np.float32(HESTON_KAPPA), xi=np.float32(HESTON_XI), rho=np.float32(HESTON_RHO), cholesky=self.cholesky,
@@ -582,7 +574,7 @@ class MarketSimulator:
             lev_hist.flush()
             
             history_days = [CURRENT_DATE + datetime.timedelta(days=t) for t in range(self.days)]
-        result["history_paths"] = {
+            result["history_paths"] = {
                 "nlv_file": nlv_file,
                 "lev_file": lev_file,
                 "shape": (NUM_PATHS, self.days),

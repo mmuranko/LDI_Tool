@@ -11,7 +11,7 @@ HESTON_XI = 0.5          # Volatility of Volatility (How aggressively the VIX it
 HESTON_RHO = -0.7        # Leverage Effect: When equities drop, variance violently spikes (highly negative correlation)
 
 # --- Simulation Risk Limits ---
-NUM_PATHS = 500000
+NUM_PATHS = 250000
 MAX_MARGIN_CALL_PROBABILITY = 0.03
 
 # --- Optimizer Bounds & Tolerance ---
@@ -103,16 +103,15 @@ ASSET_CURRENCIES = {
 # --- OTC & Fixed Income Registry ---
 OTC_REGISTRY = {
     "XS1970549561": {
-        "live_price_local": 894.70,
+        "live_price_local": 889.53,
         "proxy_ticker": "IS3C.DE"
     }
 }
 
 # --- Balance Sheet Cash State ---
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 35049.63
-CURRENT_SMA = 15290.52
-TODAY_DEPOSIT = 0
+CURRENT_DEBT = 35105.20
+CURRENT_SMA = 15619.31
 
 # --- Future Projections Config ---
 DEFAULT_MONTHLY_DEPOSIT_2026 = 1000.00
