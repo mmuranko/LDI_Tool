@@ -7,7 +7,7 @@ from rich.console import Console
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
 
 from config import (
-    CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, DEFAULT_MONTHLY_DEPOSIT_2026,
+    CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, DEPOSIT_SCHEDULE,
     DEFAULT_MONTHLY_DEPOSIT_FUTURE, HESTON_KAPPA, HESTON_RHO, HESTON_XI,
     JUMP_FREQUENCY_PER_YEAR, JUMP_MEAN_SIZE, JUMP_VOLATILITY,
     MARGIN_INTEREST_RATE, NUM_PATHS, RNG_SEED,
@@ -421,10 +421,25 @@ class MarketSimulator:
 
         self.deposits_arr = np.zeros(self.days, dtype=np.float32)
         business_month_ends = pd.date_range(start=CURRENT_DATE, end=end_date, freq="BME").date
+        
         for bme in business_month_ends:
             days_from_start = (bme - CURRENT_DATE).days
             if 0 < days_from_start < self.days:
-                amount = DEFAULT_MONTHLY_DEPOSIT_2026 if bme.year == 2026 else DEFAULT_MONTHLY_DEPOSIT_FUTURE
+                
+                # 1. Start with the default fallback amount
+                amount = DEFAULT_MONTHLY_DEPOSIT_FUTURE
+                
+                # 2. Check the schedule to see if the current bme falls into a defined range
+                for start_date, end_date, scheduled_amount in DEPOSIT_SCHEDULE:
+                    # Treat None as no boundary on that side
+                    after_start = (start_date is None) or (bme >= start_date)
+                    before_end = (end_date is None) or (bme <= end_date)
+                    
+                    if after_start and before_end:
+                        amount = scheduled_amount
+                        break  # Stop checking once we find the first matching period
+                
+                # 3. Apply the deposit
                 self.deposits_arr[days_from_start] += amount
 
         if skip_next_deposit:

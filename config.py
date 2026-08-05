@@ -11,7 +11,7 @@ HESTON_XI = 0.5          # Volatility of Volatility (How aggressively the VIX it
 HESTON_RHO = -0.7        # Leverage Effect: When equities drop, variance violently spikes (highly negative correlation)
 
 # --- Simulation Risk Limits ---
-NUM_PATHS = 250000
+NUM_PATHS = 100000
 MAX_MARGIN_CALL_PROBABILITY = 0.03
 
 # --- Optimizer Bounds & Tolerance ---
@@ -22,7 +22,7 @@ OPTIMIZER_TOLERANCE = 0.01
 DRIFT_CAP = 0.09
 
 # --- Optimizer Controls ---
-RNG_SEED = 42
+RNG_SEED = 100
 HISTORY_INTERVAL_DAYS = 126
 
 # --- Currency & FX Configuration ---
@@ -31,7 +31,7 @@ ACTIVE_ASSET = "VT"
 
 # --- Holdings Inventory ---
 HOLDINGS = {
-    "VT": 243,
+    "VT": 265,
     "ACWI.SW": 84,
     "CHDVD.SW": 51,
     "MEUD.PA": 32.6,
@@ -82,7 +82,6 @@ IM_REQUIREMENTS = {
     "XS1970549561": 0.15
 }
 
-# Explicitly declare the trading currency for every asset
 ASSET_CURRENCIES = {
     "VT": "USD",
     "ACWI.SW": "CHF",
@@ -100,22 +99,27 @@ ASSET_CURRENCIES = {
     "XS1970549561": "EUR"
 }
 
-# --- OTC & Fixed Income Registry ---
 OTC_REGISTRY = {
     "XS1970549561": {
-        "live_price_local": 889.53,
+        "live_price_local": 883.42,
         "proxy_ticker": "IS3C.DE"
     }
 }
 
 # --- Balance Sheet Cash State ---
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 35105.20
-CURRENT_SMA = 15619.31
+CURRENT_DEBT = 37004.34
+CURRENT_SMA = 16383.82
 
 # --- Future Projections Config ---
-DEFAULT_MONTHLY_DEPOSIT_2026 = 1000.00
-DEFAULT_MONTHLY_DEPOSIT_FUTURE = 2000.00
+DEFAULT_MONTHLY_DEPOSIT_FUTURE = 1000
+DEPOSIT_SCHEDULE = [
+    (datetime.date(2026, 1, 1), datetime.date(2026, 12, 31), 800),
+    (datetime.date(2027, 1, 1), datetime.date(2027, 12, 31), 100),
+    (datetime.date(2028, 1, 1), datetime.date(2028, 6, 30), 800),
+    (datetime.date(2028, 7, 1), datetime.date(2028, 12, 31), 100),
+    (datetime.date(2029, 1, 1), datetime.date(2040, 12, 31), 1500)
+]
 MARGIN_INTEREST_RATE = 0.015
 HISTORICAL_LOOKBACK_YEARS = 20
 
@@ -125,10 +129,11 @@ POST_LAST_WITHDRAWAL_BUFFER_DAYS = 15
 
 # --- Strict Liability Ledger ---
 WITHDRAWAL_SCHEDULE = [
-    {"date": datetime.date(2027, 12, 30), "amount": 5000.00},
-    {"date": datetime.date(2028, 12, 30), "amount": 5000.00},
-    {"date": datetime.date(2029, 12, 30), "amount": 5000.00},
-    {"date": datetime.date(2030, 12, 30), "amount": 5000.00},
+    #{"date": datetime.date(2027, 12, 30), "amount": 5000.00},
+    #{"date": datetime.date(2028, 12, 30), "amount": 5000.00},
+    #{"date": datetime.date(2029, 12, 30), "amount": 5000.00},
+    #{"date": datetime.date(2030, 12, 30), "amount": 5000.00},
     {"date": datetime.date(2030, 12, 1), "amount": 10774.00},
-    {"date": datetime.date(2031, 12, 30), "amount": 5000.00}
+    #{"date": datetime.date(2031, 12, 30), "amount": 5000.00}
+    {"date": datetime.date(2031, 12, 30), "amount": 1}
 ]
