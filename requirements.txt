@@ -7,3 +7,5 @@ tqdm
 scikit-learn
 rich
 numba
+pymc
+pytensor

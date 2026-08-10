@@ -1,14 +1,10 @@
 import datetime
 
-# --- Tail Risk (Merton Jump-Diffusion Parameters) ---
-JUMP_FREQUENCY_PER_YEAR = 0.06   # Expected number of macro shocks per year (e.g., 0.50 = one every 2 years)
-JUMP_MEAN_SIZE = -0.40           # Mean log-jump size. Median simple jump is exp(-0.15)-1, about -14%.
-JUMP_VOLATILITY = 0.06           # Standard deviation of log-jump size, not simple-return volatility.
-
-# --- Heston Stochastic Volatility Parameters ---
-HESTON_KAPPA = 5.0       # Mean-reversion speed (e.g., 3.0 means vol shocks decay over ~4 months)
-HESTON_XI = 0.5          # Volatility of Volatility (How aggressively the VIX itself swings)
-HESTON_RHO = -0.7        # Leverage Effect: When equities drop, variance violently spikes (highly negative correlation)
+# --- Bayesian Regime-Switching Factor Model ---
+NUM_FACTORS = 5           # Number of PCA factors to extract (Configurable)
+MCMC_DRAWS = 1000         # Number of posterior samples per chain
+MCMC_TUNE = 1000          # Number of burn-in steps for NUTS adaptation
+MCMC_CORES = 2            # CPU chains to run in parallel
 
 # --- Simulation Risk Limits ---
 NUM_PATHS = 100000
@@ -17,8 +13,6 @@ MAX_MARGIN_CALL_PROBABILITY = 0.03
 # --- Optimizer Bounds & Tolerance ---
 MAX_TARGET_LEVERAGE = 2.0
 OPTIMIZER_TOLERANCE = 0.01
-
-# Unified Drift Limit
 DRIFT_CAP = 0.09
 
 # --- Optimizer Controls ---
@@ -101,24 +95,24 @@ ASSET_CURRENCIES = {
 
 OTC_REGISTRY = {
     "XS1970549561": {
-        "live_price_local": 883.42,
+        "live_price_local": 884.91,
         "proxy_ticker": "IS3C.DE"
     }
 }
 
 # --- Balance Sheet Cash State ---
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 37004.34
-CURRENT_SMA = 16383.82
+CURRENT_DEBT = 36485
+CURRENT_SMA = 17027
 
 # --- Future Projections Config ---
 DEFAULT_MONTHLY_DEPOSIT_FUTURE = 1000
 DEPOSIT_SCHEDULE = [
     (datetime.date(2026, 1, 1), datetime.date(2026, 12, 31), 800),
-    (datetime.date(2027, 1, 1), datetime.date(2027, 12, 31), 100),
-    (datetime.date(2028, 1, 1), datetime.date(2028, 6, 30), 800),
-    (datetime.date(2028, 7, 1), datetime.date(2028, 12, 31), 100),
-    (datetime.date(2029, 1, 1), datetime.date(2040, 12, 31), 1500)
+    (datetime.date(2027, 1, 1), datetime.date(2027, 12, 31), 1200),
+    (datetime.date(2028, 1, 1), datetime.date(2028, 6, 30), 1500),
+    (datetime.date(2028, 7, 1), datetime.date(2028, 12, 31), 1800),
+    (datetime.date(2029, 1, 1), datetime.date(2040, 12, 31), 2000)
 ]
 MARGIN_INTEREST_RATE = 0.015
 HISTORICAL_LOOKBACK_YEARS = 20
@@ -129,11 +123,10 @@ POST_LAST_WITHDRAWAL_BUFFER_DAYS = 15
 
 # --- Strict Liability Ledger ---
 WITHDRAWAL_SCHEDULE = [
-    #{"date": datetime.date(2027, 12, 30), "amount": 5000.00},
-    #{"date": datetime.date(2028, 12, 30), "amount": 5000.00},
-    #{"date": datetime.date(2029, 12, 30), "amount": 5000.00},
-    #{"date": datetime.date(2030, 12, 30), "amount": 5000.00},
+    {"date": datetime.date(2027, 12, 30), "amount": 5000.00},
+    {"date": datetime.date(2028, 12, 30), "amount": 5000.00},
+    {"date": datetime.date(2029, 12, 30), "amount": 5000.00},
+    {"date": datetime.date(2030, 12, 30), "amount": 5000.00},
     {"date": datetime.date(2030, 12, 1), "amount": 10774.00},
-    #{"date": datetime.date(2031, 12, 30), "amount": 5000.00}
-    {"date": datetime.date(2031, 12, 30), "amount": 1}
+    {"date": datetime.date(2031, 12, 30), "amount": 5000.00}
 ]

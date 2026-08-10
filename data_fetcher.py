@@ -139,7 +139,9 @@ class DataEngine:
                     self.data[ticker] = self.data[ticker] * df[fx_ticker]
 
         self.data.dropna(how="all", inplace=True)
-        console.print("✓ [green]Unified market data ingested successfully.[/green]")
+        
+        num_days = len(self.data)
+        console.print(f"✓ [green]Unified market data ingested successfully. Loaded {num_days:,} historical daily datapoints.[/green]")
 
     def build_current_state(self) -> dict:
         # Force the Active Asset to be exactly at Index 0.

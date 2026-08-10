@@ -11,12 +11,14 @@ from rich.table import Table
 from rich.prompt import Confirm
 
 from data_fetcher import DataEngine
+from calibration import BayesianFactorCalibrator
 from engine import MarketSimulator
 from optimizer import CRNGridOptimizer
 from config import (
     CURRENT_DATE, CURRENT_DEBT, CURRENT_SMA, NUM_PATHS, 
     MAX_MARGIN_CALL_PROBABILITY, POST_LAST_WITHDRAWAL_BUFFER_DAYS, 
-    POST_LAST_WITHDRAWAL_BUFFER_MONTHS, ACTIVE_ASSET, WITHDRAWAL_SCHEDULE, BASE_CURRENCY
+    POST_LAST_WITHDRAWAL_BUFFER_MONTHS, ACTIVE_ASSET, WITHDRAWAL_SCHEDULE, BASE_CURRENCY,
+    NUM_FACTORS, MCMC_DRAWS, MCMC_TUNE, MCMC_CORES
 )
 
 console = Console()
@@ -145,10 +147,18 @@ def print_execution_directive(optimal_results: dict, state: dict) -> None:
     cash_used_for_purchase = min(cash, purchase_amount)
     borrowed_amount = purchase_amount - cash_used_for_purchase
 
+    # --- ENHANCEMENT 2: Calculate Deleveraging Deposit ---
+    current_leverage = gross / nlv if nlv > 0.0 else float("inf")
+    deposit_needed = 0.0
+    if current_leverage > optimal_lev and optimal_lev > 0.0:
+        deposit_needed = (gross / optimal_lev) - nlv
+    # -----------------------------------------------------
+
     rows = [
         ["Ruin Status", _risk_status(prob_ruin)],
         ["Optimal Target Leverage", _fmt_x(optimal_lev)],
-        ["Required Margin Borrowing", _fmt_base_ccy(borrowed_amount)],
+        ["Required Margin Borrowing (to buy)", _fmt_base_ccy(borrowed_amount)],
+        ["Required Cash Deposit (to deleverage)", f"[bold red]{_fmt_base_ccy(deposit_needed)}[/bold red]"],
         [f"Total {ACTIVE_ASSET} Purchase", f"[bold green]{_fmt_base_ccy(purchase_amount)}[/bold green]"],
         ["Dual-Constraint Ruin Prob.", _fmt_pct(prob_ruin)],
         ["Breach Upper 95% Bound", _fmt_pct(upper_95_ruin)],
@@ -520,22 +530,28 @@ def plot_terminal_nlv_distribution(
 # =============================================================================
 
 def main() -> None:
-    print_banner("IBKR LDI Optimization Engine", "Dual-Constraint Ruin Engine (Reg T SMA + Maintenance Margin)")
+    print_banner("IBKR LDI Optimization Engine", "Bayesian Regime-Switching Factor Framework")
 
+    # 1. Fetch historical data & print loaded days (Enhancement 1 via DataEngine internally)
     data_engine = DataEngine()
     data_engine.fetch_data()
+    console.print(f"[dim]Total historical market days loaded into memory: {len(data_engine.data):,}[/dim]\n")
     state = data_engine.build_current_state()
-    params = data_engine.estimate_parameters()
-
+    
     print_initial_state(state)
+    
+    # 2. Extract PCA Factors and run PyMC Bayesian Calibration
+    calibrator = BayesianFactorCalibrator(data_engine.data, num_factors=NUM_FACTORS)
+    mcmc_params = calibrator.fit(draws=MCMC_DRAWS, tune=MCMC_TUNE, cores=MCMC_CORES)
 
-    skip_deposit = Confirm.ask("\n[bold yellow]?[/bold yellow] Skip the next scheduled month-end deposit? (e.g., if already manually funded and reflected in config.py)", default=False)
+    skip_deposit = Confirm.ask("\n[bold yellow]?[/bold yellow] Skip the next scheduled month-end deposit?", default=False)
     console.print()
 
     last_withdrawal_date = max(w["date"] for w in WITHDRAWAL_SCHEDULE)
     final_date = last_withdrawal_date + relativedelta(months=POST_LAST_WITHDRAWAL_BUFFER_MONTHS, days=POST_LAST_WITHDRAWAL_BUFFER_DAYS)
 
-    simulator = MarketSimulator(state, params, final_date, skip_next_deposit=skip_deposit)
+    # 3. Feed the Bayesian MCMC parameters into the Simulator
+    simulator = MarketSimulator(state, mcmc_params, final_date, skip_next_deposit=skip_deposit)
     print_simulation_horizon(simulator, final_date, last_withdrawal_date)
 
     optimizer = CRNGridOptimizer(simulator)
