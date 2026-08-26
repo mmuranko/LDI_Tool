@@ -54,9 +54,15 @@ class DataEngine:
         return df
 
     @staticmethod
-    def _cap_drift(raw_mu: float, cap: float) -> float:
-        if not np.isfinite(raw_mu): return 0.0
-        return min(float(raw_mu), cap)
+    def _cap_drift(raw_log_mu: float, sigma: float, simple_cap: float) -> float:
+        if not np.isfinite(raw_log_mu) or not np.isfinite(sigma): 
+            return 0.0
+        # Compute expected annual simple return
+        annual_simple_return = np.exp(raw_log_mu + 0.5 * (sigma ** 2)) - 1.0
+        if annual_simple_return > simple_cap:
+            # Back out capped log drift
+            return float(np.log(1.0 + simple_cap) - 0.5 * (sigma ** 2))
+        return float(raw_log_mu)
 
     @staticmethod
     def _sanitize_corr_matrix(corr_matrix: np.ndarray, epsilon: float = 1e-8) -> np.ndarray:
@@ -188,8 +194,8 @@ class DataEngine:
                 ret = self._log_returns_from_prices(self.raw_local_data[query_ticker].rename(factor_name)).dropna()
 
                 sigma = float(ret.std() * np.sqrt(252))
-                mu_raw = float((ret.mean() * 252) + (sigma**2 / 2))
-                mu = self._cap_drift(mu_raw, DRIFT_CAP)
+                raw_log_mu = float(ret.mean() * 252)
+                mu = self._cap_drift(raw_log_mu, sigma, DRIFT_CAP)
 
                 factor_names.append(factor_name)
                 factor_types[factor_name] = "asset"
