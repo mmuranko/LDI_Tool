@@ -1,4 +1,5 @@
 import datetime
+from dateutil.relativedelta import relativedelta
 import numpy as np
 import pandas as pd
 from numba import njit, prange
@@ -478,20 +479,55 @@ class MarketSimulator:
                 
                 self.bond_duration[a] = b_info["proxy_duration"]
                 self.bond_convexity[a] = b_info.get("proxy_convexity", 0.0)
-                self.bond_initial_ytm[a] = b_info["current_ytm"]
                 
-                total_face = info["quantity"] * b_info["face_value_local"] * info["fx_rate"]
+                months_step = 6 if b_info.get("semi_annual", False) else 12
+                coupon_payment = b_info["coupon_rate"] / (12 / months_step)
+                face_local = b_info["face_value_local"]
+                
+                total_face_base = info["quantity"] * face_local * info["fx_rate"]
+                target_price_local = info["current_price_local"]
+                
                 curr_date = b_info["maturity_date"]
                 cfs = []
                 while curr_date > CURRENT_DATE:
                     cfs.append(curr_date)
-                    curr_date = datetime.date(curr_date.year - 1, curr_date.month, curr_date.day)
+                    curr_date -= relativedelta(months=months_step)
                 cfs.sort()
+                
+                days_arr = []
+                amts_local_arr = []
+                
                 for idx, cf_d in enumerate(cfs[:20]):
                     days_out = (cf_d - CURRENT_DATE).days
                     if days_out < self.days:
                         self.bond_cf_days[a, idx] = days_out
-                        self.bond_cf_amounts[a, idx] = total_face * (1 + b_info["coupon_rate"]) if cf_d == b_info["maturity_date"] else total_face * b_info["coupon_rate"]
+                        is_maturity = (cf_d == b_info["maturity_date"])
+                        
+                        # Store total base-currency CF for the Numba Monte Carlo simulation
+                        cf_amt_base = total_face_base * (1.0 + coupon_payment) if is_maturity else total_face_base * coupon_payment
+                        self.bond_cf_amounts[a, idx] = cf_amt_base
+                        
+                        # Store local-currency CF per 1 bond to calculate exact YTM
+                        days_arr.append(days_out)
+                        cf_amt_local = face_local * (1.0 + coupon_payment) if is_maturity else face_local * coupon_payment
+                        amts_local_arr.append(cf_amt_local)
+                
+                # --- DYNAMIC YTM SOLVER (Bisection Method) ---
+                days_np = np.array(days_arr, dtype=np.float32)
+                amts_np = np.array(amts_local_arr, dtype=np.float32)
+                
+                low, high = -0.20, 0.50
+                for _ in range(100):
+                    mid = (low + high) / 2.0
+                    pv = np.sum(amts_np * np.exp(-mid * (days_np / 365.25)))
+                    if pv > target_price_local:
+                        low = mid
+                    else:
+                        high = mid
+                
+                # SDE initialized with exact implied continuous yield
+                self.bond_initial_ytm[a] = float(mid)
+                
             else:
                 self.asset_type[a] = 0
                 self.div_mean[a], self.div_vol[a], self.div_yield_init[a] = info.get("mean_yield", 0.0), info.get("yield_vol", 0.0), info.get("ttm_yield", 0.0)

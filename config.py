@@ -26,9 +26,9 @@ MCMC_CORES = 8                      # Parallel CPU chains
 # =============================================================================
 # 4. SHARED MONTE CARLO & OPTIMIZER SETTINGS
 # =============================================================================
-NUM_PATHS = 150000                  
+NUM_PATHS = 250000                  
 MAX_MARGIN_CALL_PROBABILITY = 0.035  
-MAX_TARGET_LEVERAGE = 1.75           
+MAX_TARGET_LEVERAGE = 1.750           
 OPTIMIZER_TOLERANCE = 0.005          
 RNG_SEED = 42                      
 HISTORY_INTERVAL_DAYS = 126         
@@ -40,11 +40,11 @@ BASE_CURRENCY = "CHF"
 ACTIVE_ASSET = "VT"
 
 CURRENT_DATE = datetime.date.today()
-CURRENT_DEBT = 38385.58
-CURRENT_SMA = 16858.30
+CURRENT_DEBT = 38591.19
+CURRENT_SMA = 17080.25
 
 HOLDINGS = {
-    "VT": 522.5,
+    "VT": 529,
     "CHDVD.SW": 51,
     "MEUD.PA": 32.6,
     "VNA.DE": 251,
@@ -101,7 +101,7 @@ ASSET_CURRENCIES = {
 
 BOND_REGISTRY = {
     "XS1970549561": { # IE00B9M6RS56
-        "current_ytm": 0.0592,
+        "current_price_local": 837.33,
         "maturity_date": datetime.date(2034, 4, 3),
         "coupon_rate": 0.035,
         "face_value_local": 1000.0,
@@ -118,11 +118,11 @@ BOND_REGISTRY = {
 
 DEFAULT_MONTHLY_DEPOSIT_FUTURE = 1000.00
 DEPOSIT_SCHEDULE = [
-    (datetime.date(2026, 1, 1), datetime.date(2026, 12, 31), 800.00),
-    (datetime.date(2027, 1, 1), datetime.date(2027, 12, 31), 1200.00),
-    (datetime.date(2028, 1, 1), datetime.date(2028, 6, 30), 1500.00),
-    (datetime.date(2028, 7, 1), datetime.date(2028, 12, 31), 1800.00),
-    (datetime.date(2029, 1, 1), datetime.date(2040, 12, 31), 2000.00)
+    (datetime.date(2026, 1, 1), datetime.date(2026, 12, 31), 300.00),
+    (datetime.date(2027, 1, 1), datetime.date(2027, 12, 31), 2000.00),
+    (datetime.date(2028, 1, 1), datetime.date(2028, 6, 30), 2100.00),
+    (datetime.date(2028, 7, 1), datetime.date(2028, 12, 31), 2200.00),
+    (datetime.date(2029, 1, 1), datetime.date(2040, 12, 31), 2300.00)
 ]
 
 POST_LAST_WITHDRAWAL_BUFFER_MONTHS = 11

@@ -128,7 +128,9 @@ class DataEngine:
             meta = self.asset_meta[ticker]
             
             if ticker in BOND_REGISTRY:
-                value_base = quantity * BOND_REGISTRY[ticker]["face_value_local"] * meta["fx_rate"]
+                live_price = BOND_REGISTRY[ticker]["current_price_local"]
+                value_base = quantity * live_price * meta["fx_rate"]
+                meta["current_price_local"] = live_price  # Pass to engine
                 
             assets_dict[ticker] = {
                 "ticker": ticker, 
